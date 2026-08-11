@@ -768,7 +768,13 @@ func hashFile(p string) (string, error) {
 	_, e = io.Copy(h, f)
 	return hex.EncodeToString(h.Sum(nil)), e
 }
-func id() string { b := make([]byte, 16); rand.Read(b); return hex.EncodeToString(b) }
+func id() string {
+	b := make([]byte, 16)
+	if _, e := rand.Read(b); e != nil {
+		panic(e)
+	}
+	return hex.EncodeToString(b)
+}
 func nullable(v sql.NullString) any {
 	if v.Valid {
 		return v.String
@@ -782,6 +788,9 @@ func artifactURL(j Job) any {
 	return nil
 }
 func truncate(x string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	if len(x) > n {
 		return x[:n]
 	}
