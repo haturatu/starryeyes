@@ -1,0 +1,22 @@
+services:
+  starryeyes:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      DATA_DIR: /var/lib/starryeyes
+      SPOOL_CAPACITY_BYTES: "21474836480" # 20 GiB: admission-control reservation budget
+      CHUNK_SIZE_BYTES: "67108864"         # 64 MiB
+      MAX_ACTIVE_TRANSCODES: "2"
+      CGROUP_ROOT: ""
+      REQUIRE_CGROUP: "false"
+      REQUIRE_LANDLOCK: "true"
+    volumes:
+      - type: bind
+        source: /var/lib/starryeyes
+        target: /var/lib/starryeyes
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=256m"]
+    restart: unless-stopped

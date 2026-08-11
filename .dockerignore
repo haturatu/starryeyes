@@ -1,0 +1,9 @@
+.git
+.gitignore
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.mp4
+*.mkv
+*.webm
+bin

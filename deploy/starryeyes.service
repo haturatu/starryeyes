@@ -1,0 +1,23 @@
+[Unit]
+Description=Starryeyes media conversion daemon
+After=network-online.target
+
+[Service]
+User=starryeyes
+Group=starryeyes
+ExecStart=/usr/local/bin/starryeyes
+Environment=DATA_DIR=/var/lib/starryeyes
+Environment=CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
+Environment=REQUIRE_CGROUP=true
+Environment=REQUIRE_LANDLOCK=true
+Delegate=yes
+TasksMax=infinity
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/starryeyes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
