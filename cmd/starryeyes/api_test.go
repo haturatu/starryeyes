@@ -10,8 +10,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpenAPIContract(t *testing.T) {
@@ -104,7 +106,7 @@ func TestOpenAPIContract(t *testing.T) {
 }
 
 func TestAPITypedResponses(t *testing.T) {
-	_, server := newAPITestServer(t)
+	service, server := newAPITestServer(t)
 	payload := []byte(`{"input":{"filename":"clip.mp4","size":1024},"output":{"preset":"web-1080p"}}`)
 	response, err := http.Post(server.URL+"/v1/jobs", "application/json", bytes.NewReader(payload))
 	if err != nil {
@@ -118,9 +120,10 @@ func TestAPITypedResponses(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
 		t.Fatalf("decode create response: %v", err)
 	}
-	if created.ID == "" || created.State != createdState || created.Upload.Mode != "chunked" || created.Upload.ChunkSize == 0 || created.Upload.RequiredHeader != "X-Chunk-SHA256" {
-		t.Errorf("create response = %#v, want a complete API create response", created)
+	if created.ID == "" || created.State != pending || created.ReservationBytes != 0 || created.Upload != nil {
+		t.Errorf("create response = %#v, want a pending job without upload instructions", created)
 	}
+	service.admitPending()
 
 	jobResponse, err := http.Get(server.URL + "/v1/jobs/" + created.ID)
 	if err != nil {
@@ -134,8 +137,8 @@ func TestAPITypedResponses(t *testing.T) {
 	if err := json.NewDecoder(jobResponse.Body).Decode(&job); err != nil {
 		t.Fatalf("decode job response: %v", err)
 	}
-	if job.ID != created.ID || job.State != createdState || job.Filename != "clip.mp4" || job.Error != nil || job.OutputURL != nil {
-		t.Errorf("job response = %#v, want the created job in its initial state", job)
+	if job.ID != created.ID || job.State != admitted || job.Filename != "clip.mp4" || job.Error != nil || job.OutputURL != nil || job.Upload == nil || job.Upload.Mode != "chunked" || job.Upload.ChunkSize == 0 || job.Upload.RequiredHeader != "X-Chunk-SHA256" {
+		t.Errorf("job response = %#v, want an admitted job with upload instructions", job)
 	}
 
 	invalid, err := http.Post(server.URL+"/v1/jobs", "application/json", bytes.NewBufferString("{"))
@@ -155,7 +158,85 @@ func TestAPITypedResponses(t *testing.T) {
 	}
 }
 
-const createdState = "CREATED"
+func TestUploadAdmissionQueue(t *testing.T) {
+	service, server := newAPITestServer(t)
+	const inputSize = int64(2 << 20)
+	if _, err := service.db.Exec(`UPDATE capacity SET total=?`, inputSize); err != nil {
+		t.Fatal(err)
+	}
+
+	first := createAPITestJob(t, server.URL, inputSize)
+	second := createAPITestJob(t, server.URL, inputSize)
+	if first.State != pending || second.State != pending {
+		t.Fatalf("create states = %q, %q; want both PENDING", first.State, second.State)
+	}
+
+	service.admitPending()
+	firstJob, err := service.job(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := service.job(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstJob.State == secondJob.State {
+		t.Fatalf("admission states = %q, %q; want exactly one admitted", firstJob.State, secondJob.State)
+	}
+	admittedJob, pendingID := firstJob, second.ID
+	if secondJob.State == admitted {
+		admittedJob, pendingID = secondJob, first.ID
+	}
+	if admittedJob.Reserved != inputSize {
+		t.Errorf("admitted reservation = %d, want %d", admittedJob.Reserved, inputSize)
+	}
+	service.release(admittedJob)
+	service.admitPending()
+	if job := waitForJobState(t, service, pendingID, admitted); job.Reserved != inputSize {
+		t.Errorf("newly admitted reservation = %d, want %d", job.Reserved, inputSize)
+	}
+}
+
+func createAPITestJob(t *testing.T, baseURL string, size int64) APICreateJobResponse {
+	t.Helper()
+	payload := []byte(`{"input":{"filename":"clip.mp4","size":` + strconv.FormatInt(size, 10) + `},"output":{"preset":"web-1080p"}}`)
+	response, err := http.Post(baseURL+"/v1/jobs", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create response status = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	var job APICreateJobResponse
+	if err := json.NewDecoder(response.Body).Decode(&job); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	return job
+}
+
+func waitForJobState(t *testing.T, service *Server, id string, states ...string) Job {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		job, err := service.job(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, state := range states {
+			if job.State == state {
+				return job
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	job, err := service.job(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("job %s state = %s, want one of %v", id, job.State, states)
+	return Job{}
+}
 
 func newAPITestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
