@@ -64,6 +64,7 @@ type Job struct {
 	Size, Received, Reserved                         int64
 	Chunks, Expected                                 int
 	Error, Artifact                                  sql.NullString
+	CreatedAt                                        string
 }
 type Probe struct {
 	Format struct {
@@ -80,9 +81,19 @@ type Probe struct {
 }
 
 func main() {
+	backfill := len(os.Args) == 2 && os.Args[1] == "backfill"
+	if len(os.Args) > 1 && !backfill {
+		stdlog.Fatalf("usage: %s [backfill]", os.Args[0])
+	}
 	c, e := configFromEnv()
 	if e != nil {
 		stdlog.Fatal(e)
+	}
+	if backfill {
+		if e := runBackfill(c); e != nil {
+			stdlog.Fatal(e)
+		}
+		return
 	}
 	if c.Chunk < 1<<20 || c.Active < 1 {
 		stdlog.Fatal("invalid config")
@@ -538,7 +549,7 @@ func (s *Server) prepareInput(j Job) error {
 
 func (s *Server) job(id string) (Job, error) {
 	var j Job
-	e := s.db.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.State, &j.Filename, &j.Size, &j.Received, &j.Chunks, &j.Expected, &j.Spec, &j.InputHash, &j.ActualHash, &j.Reserved, &j.Error, &j.Artifact)
+	e := s.db.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact,created_at FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.State, &j.Filename, &j.Size, &j.Received, &j.Chunks, &j.Expected, &j.Spec, &j.InputHash, &j.ActualHash, &j.Reserved, &j.Error, &j.Artifact, &j.CreatedAt)
 	return j, e
 }
 func (s *Server) recover() {
@@ -609,7 +620,15 @@ func (s *Server) run(jid string) {
 		s.fail(jid, fmt.Errorf("transcode: %w: %s", e, truncate(stderr.String(), 1000)))
 		return
 	}
-	s.db.Exec(`UPDATE jobs SET state=?,artifact=?,finished_at=? WHERE id=?`, completed, artifact, time.Now().UTC(), jid)
+	completedAt := time.Now().UTC()
+	if e := s.writeOutputManifest(j, o, artifact, completedAt); e != nil {
+		s.fail(jid, fmt.Errorf("write output manifest: %w", e))
+		return
+	}
+	if _, e := s.db.Exec(`UPDATE jobs SET state=?,artifact=?,finished_at=? WHERE id=?`, completed, artifact, completedAt, jid); e != nil {
+		s.fail(jid, fmt.Errorf("record completed output: %w", e))
+		return
+	}
 	s.release(j)
 	s.log.Info("job completed", "id", jid)
 }
