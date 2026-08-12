@@ -2,6 +2,7 @@
  * An empty --cgroup is the explicit Compose development mode. */
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -10,7 +11,8 @@ int main(int argc, char **argv) {
   if (argc < 5 || strcmp(argv[1], "--cgroup") || strcmp(argv[3], "--")) return 64;
   if (argv[2][0]) {
     char p[4096], pid[32];
-    snprintf(p, sizeof p, "%s/cgroup.procs", argv[2]);
+    int need = snprintf(p, sizeof p, "%s/cgroup.procs", argv[2]);
+    if (need < 0 || (size_t)need >= sizeof p) { fprintf(stderr, "cgroup path too long\n"); return 126; }
     int fd = open(p, O_WRONLY|O_CLOEXEC);
     if (fd < 0) { perror("open cgroup.procs"); return 126; }
     int n = snprintf(pid, sizeof pid, "%ld", (long)getpid());
