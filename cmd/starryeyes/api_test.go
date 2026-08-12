@@ -104,7 +104,7 @@ func TestOpenAPIContract(t *testing.T) {
 }
 
 func TestAPITypedResponses(t *testing.T) {
-	server := newAPITestServer(t)
+	_, server := newAPITestServer(t)
 	payload := []byte(`{"input":{"filename":"clip.mp4","size":1024},"output":{"preset":"web-1080p"}}`)
 	response, err := http.Post(server.URL+"/v1/jobs", "application/json", bytes.NewReader(payload))
 	if err != nil {
@@ -157,7 +157,7 @@ func TestAPITypedResponses(t *testing.T) {
 
 const createdState = "CREATED"
 
-func newAPITestServer(t *testing.T) *httptest.Server {
+func newAPITestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
 	for _, path := range []string{dir, filepath.Join(dir, "spool"), filepath.Join(dir, "output")} {
@@ -182,7 +182,7 @@ func newAPITestServer(t *testing.T) *httptest.Server {
 	}
 	httpServer := httptest.NewServer(newRouter(server))
 	t.Cleanup(httpServer.Close)
-	return httpServer
+	return server, httpServer
 }
 
 func openAPIDocument(t *testing.T, baseURL string) map[string]any {
