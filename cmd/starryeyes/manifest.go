@@ -73,7 +73,7 @@ func (s *Server) writeOutputManifest(j Job, output Output, artifact string, comp
 		OutputSHA256:         outputSHA256,
 		InputSize:            j.Size,
 		OutputSize:           info.Size(),
-		ChunkSize:            s.cfg.Chunk,
+		ChunkSize:            j.ChunkSize,
 		CreatedAt:            createdAt.Format(time.RFC3339Nano),
 		CompletedAt:          completedAt.Format(time.RFC3339Nano),
 		Output:               output,
@@ -281,7 +281,7 @@ func (s *Server) importOutputManifest(manifest OutputManifest) (string, error) {
 	}
 	defer tx.Rollback()
 	var existing manifestJob
-	err = tx.QueryRow(`SELECT state,filename,size,received,chunks,expected,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,COALESCE(error,''),COALESCE(artifact,''),created_at,COALESCE(finished_at,'') FROM jobs WHERE id=?`, manifest.JobID).Scan(&existing.State, &existing.Filename, &existing.Size, &existing.Received, &existing.Chunks, &existing.Expected, &existing.Spec, &existing.InputHash, &existing.ActualHash, &existing.Reserved, &existing.Error, &existing.Artifact, &existing.CreatedAt, &existing.FinishedAt)
+	err = tx.QueryRow(`SELECT state,filename,size,received,chunks,expected,chunk_size,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,COALESCE(error,''),COALESCE(artifact,''),created_at,COALESCE(finished_at,'') FROM jobs WHERE id=?`, manifest.JobID).Scan(&existing.State, &existing.Filename, &existing.Size, &existing.Received, &existing.Chunks, &existing.Expected, &existing.ChunkSize, &existing.Spec, &existing.InputHash, &existing.ActualHash, &existing.Reserved, &existing.Error, &existing.Artifact, &existing.CreatedAt, &existing.FinishedAt)
 	if err == nil && existing.State == completed {
 		if !existing.matchesManifest(manifest, expected) {
 			return "existing_conflict", errCompletedManifestConflict
@@ -292,7 +292,7 @@ func (s *Server) importOutputManifest(manifest OutputManifest) (string, error) {
 		return "", err
 	}
 	if existing.State == "" {
-		_, err = tx.Exec(`INSERT INTO jobs(id,state,filename,size,received,chunks,expected,spec,input_hash,actual_hash,reserved,artifact,created_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, manifest.JobID, completed, manifest.OriginalFilename, manifest.InputSize, manifest.InputSize, expected, expected, string(spec), manifest.RequestedInputSHA256, manifest.InputSHA256, 0, manifest.Artifact, manifest.CreatedAt, manifest.CompletedAt)
+		_, err = tx.Exec(`INSERT INTO jobs(id,state,filename,size,received,chunks,expected,chunk_size,spec,input_hash,actual_hash,reserved,artifact,created_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, manifest.JobID, completed, manifest.OriginalFilename, manifest.InputSize, manifest.InputSize, expected, expected, manifest.ChunkSize, string(spec), manifest.RequestedInputSHA256, manifest.InputSHA256, 0, manifest.Artifact, manifest.CreatedAt, manifest.CompletedAt)
 		if err != nil {
 			return "", err
 		}
@@ -309,7 +309,7 @@ func (s *Server) importOutputManifest(manifest OutputManifest) (string, error) {
 			return "", err
 		}
 	}
-	_, err = tx.Exec(`UPDATE jobs SET state=?,filename=?,size=?,received=?,chunks=?,expected=?,spec=?,input_hash=?,actual_hash=?,reserved=0,error=NULL,artifact=?,created_at=?,finished_at=? WHERE id=?`, completed, manifest.OriginalFilename, manifest.InputSize, manifest.InputSize, expected, expected, string(spec), manifest.RequestedInputSHA256, manifest.InputSHA256, manifest.Artifact, manifest.CreatedAt, manifest.CompletedAt, manifest.JobID)
+	_, err = tx.Exec(`UPDATE jobs SET state=?,filename=?,size=?,received=?,chunks=?,expected=?,chunk_size=?,spec=?,input_hash=?,actual_hash=?,reserved=0,error=NULL,artifact=?,expires_at=NULL,created_at=?,finished_at=? WHERE id=?`, completed, manifest.OriginalFilename, manifest.InputSize, manifest.InputSize, expected, expected, manifest.ChunkSize, string(spec), manifest.RequestedInputSHA256, manifest.InputSHA256, manifest.Artifact, manifest.CreatedAt, manifest.CompletedAt, manifest.JobID)
 	if err != nil {
 		return "", err
 	}
@@ -319,11 +319,12 @@ func (s *Server) importOutputManifest(manifest OutputManifest) (string, error) {
 type manifestJob struct {
 	State, Filename, Spec, InputHash, ActualHash, Error, Artifact, CreatedAt, FinishedAt string
 	Size, Received, Reserved                                                             int64
+	ChunkSize                                                                            int64
 	Chunks, Expected                                                                     int
 }
 
 func (j manifestJob) matchesManifest(manifest OutputManifest, expected int) bool {
-	if j.Filename != manifest.OriginalFilename || j.Size != manifest.InputSize || j.Received != manifest.InputSize || j.Chunks != expected || j.Expected != expected || j.InputHash != manifest.RequestedInputSHA256 || j.ActualHash != manifest.InputSHA256 || j.Reserved != 0 || j.Error != "" || j.Artifact != manifest.Artifact {
+	if j.Filename != manifest.OriginalFilename || j.Size != manifest.InputSize || j.Received != manifest.InputSize || j.Chunks != expected || j.Expected != expected || j.ChunkSize != manifest.ChunkSize || j.InputHash != manifest.RequestedInputSHA256 || j.ActualHash != manifest.InputSHA256 || j.Reserved != 0 || j.Error != "" || j.Artifact != manifest.Artifact {
 		return false
 	}
 	var output Output

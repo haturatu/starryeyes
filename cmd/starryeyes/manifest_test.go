@@ -32,6 +32,7 @@ func TestOutputManifestBackfillsLostDatabase(t *testing.T) {
 		InputHash:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		Size:       2 << 20,
+		ChunkSize:  1 << 20,
 		CreatedAt:  createdAt,
 	}
 	output := Output{Container: "mp4", Video: Video{Codec: "h264", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
@@ -82,7 +83,7 @@ func TestBackfillRejectsModifiedArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := newManifestTestServer(t, t.TempDir(), outputDir)
-	job := Job{ID: jobID, Filename: "clip.mp4", ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 1 << 20, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	job := Job{ID: jobID, Filename: "clip.mp4", ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 1 << 20, ChunkSize: 1 << 20, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	output := Output{Container: "mp4", Video: Video{Codec: "h264", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
 	if err := writer.writeOutputManifest(job, output, "output.mp4", time.Now().UTC()); err != nil {
 		t.Fatal(err)
@@ -116,7 +117,7 @@ func TestBackfillClearsChunksWhenCompletingExistingJob(t *testing.T) {
 	}
 	writer := newManifestTestServer(t, t.TempDir(), outputDir)
 	output := Output{Container: "mp4", Video: Video{Codec: "h264", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
-	manifestJob := Job{ID: jobID, Filename: "clip.mp4", ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 2 << 20, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	manifestJob := Job{ID: jobID, Filename: "clip.mp4", ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 2 << 20, ChunkSize: 1 << 20, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	if err := writer.writeOutputManifest(manifestJob, output, "output.mp4", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +127,7 @@ func TestBackfillClearsChunksWhenCompletingExistingJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := recovery.db.Exec(`INSERT INTO jobs(id,state,filename,size,received,chunks,expected,spec,reserved,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, jobID, uploading, "stale.mp4", 2<<20, 1<<20, 1, 2, string(spec), 2<<20, time.Now().UTC()); err != nil {
+	if _, err := recovery.db.Exec(`INSERT INTO jobs(id,state,filename,size,received,chunks,expected,chunk_size,spec,reserved,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, jobID, uploading, "stale.mp4", 2<<20, 1<<20, 1, 2, 1<<20, string(spec), 2<<20, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := recovery.db.Exec(`INSERT INTO reservations(job_id,input_bytes,output_bytes,safety_bytes,total) VALUES(?,?,?,?,?)`, jobID, 2<<20, 0, 0, 2<<20); err != nil {
@@ -167,7 +168,7 @@ func TestBackfillReportsCompletedJobConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := newManifestTestServer(t, t.TempDir(), outputDir)
-	job := Job{ID: jobID, Filename: "clip.mp4", ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 1 << 20, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	job := Job{ID: jobID, Filename: "clip.mp4", ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 1 << 20, ChunkSize: 1 << 20, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	upscale := true
 	output := Output{Container: "mp4", Video: Video{Codec: "h264", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "fit", Width: 1280, Height: 720, Upscale: &upscale}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
 	if err := writer.writeOutputManifest(job, output, "output.mp4", time.Now().UTC()); err != nil {
@@ -207,7 +208,7 @@ func TestSyncDirectoryIgnoresUnsupportedDirectoryFsync(t *testing.T) {
 func TestJobCreatedAtCanBeStoredInManifest(t *testing.T) {
 	server := newManifestTestServer(t, t.TempDir(), t.TempDir())
 	createdAt := time.Now().UTC()
-	if _, err := server.db.Exec(`INSERT INTO jobs(id,state,filename,size,expected,spec,reserved,created_at) VALUES(?,?,?,?,?,?,?,?)`, "job", pending, "clip.mp4", 1, 1, `{}`, 0, createdAt); err != nil {
+	if _, err := server.db.Exec(`INSERT INTO jobs(id,state,filename,size,expected,chunk_size,spec,reserved,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, "job", pending, "clip.mp4", 1, 1, 1, `{}`, 0, createdAt); err != nil {
 		t.Fatal(err)
 	}
 	job, err := server.job("job")
@@ -234,7 +235,7 @@ func TestRunBackfillRecreatesDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := newManifestTestServer(t, t.TempDir(), outputDir)
-	job := Job{ID: jobID, Filename: "clip.mp4", ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 1 << 20, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	job := Job{ID: jobID, Filename: "clip.mp4", ActualHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 1 << 20, ChunkSize: 1 << 20, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	output := Output{Container: "mp4", Video: Video{Codec: "h264", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
 	if err := writer.writeOutputManifest(job, output, "output.mp4", time.Now().UTC()); err != nil {
 		t.Fatal(err)
