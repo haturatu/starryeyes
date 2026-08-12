@@ -117,7 +117,7 @@ func newRouter(s *Server) http.Handler {
 		Parameters: []*huma.Param{
 			pathParam("id", "Job identifier.", &huma.Schema{Type: huma.TypeString}),
 			pathParam("chunk", "Zero-based chunk number.", &huma.Schema{Type: huma.TypeInteger, Minimum: ptr(float64(0))}),
-			{Name: "X-Chunk-SHA256", In: "header", Required: true, Description: "Lowercase or uppercase hexadecimal SHA-256 of the chunk.", Schema: &huma.Schema{Type: huma.TypeString, MinLength: ptr(64), MaxLength: ptr(64)}},
+			{Name: "X-Chunk-SHA256", In: "header", Required: true, Description: "Lowercase or uppercase hexadecimal SHA-256 of the chunk.", Schema: &huma.Schema{Type: huma.TypeString, MinLength: ptr(64), MaxLength: ptr(64), Pattern: "^[0-9a-fA-F]{64}$"}},
 		},
 		RequestBody: &huma.RequestBody{Required: true, Description: "Raw bytes for exactly one chunk.", Content: map[string]*huma.MediaType{
 			"application/octet-stream": {Schema: &huma.Schema{Type: huma.TypeString, Format: "binary"}},
@@ -159,7 +159,7 @@ func newRouter(s *Server) http.Handler {
 		Summary:     "Download a completed output artifact",
 		Parameters:  []*huma.Param{pathParam("id", "Job identifier.", &huma.Schema{Type: huma.TypeString})},
 		Responses: mergeResponses(
-			map[string]*huma.Response{strconv.Itoa(http.StatusOK): {Description: "Completed media artifact", Content: map[string]*huma.MediaType{"application/octet-stream": {Schema: &huma.Schema{Type: huma.TypeString, Format: "binary"}}}}},
+			mediaArtifactResponse(),
 			errorResponses(api, http.StatusNotFound, http.StatusInternalServerError),
 		),
 	}, s.output)
@@ -200,6 +200,22 @@ func errorResponses(api huma.API, statuses ...int) map[string]*huma.Response {
 		}}
 	}
 	return result
+}
+
+func mediaArtifactResponse() map[string]*huma.Response {
+	content := map[string]*huma.MediaType{}
+	for _, mediaType := range []string{
+		"video/mp4",
+		"video/webm",
+		"video/x-matroska",
+		"application/octet-stream",
+	} {
+		content[mediaType] = &huma.MediaType{Schema: &huma.Schema{Type: huma.TypeString, Format: "binary"}}
+	}
+	return map[string]*huma.Response{strconv.Itoa(http.StatusOK): {
+		Description: "Completed media artifact. The content type depends on the generated container; application/octet-stream is the fallback.",
+		Content:     content,
+	}}
 }
 
 func mergeResponses(groups ...map[string]*huma.Response) map[string]*huma.Response {

@@ -55,39 +55,39 @@ type Server struct {
 	locks      sync.Map
 }
 type Input struct {
-	Filename string `json:"filename"`
-	Size     int64  `json:"size"`
-	SHA256   string `json:"sha256"`
+	Filename string `json:"filename" minLength:"1" doc:"Basename of the uploaded media file; path separators are not allowed."`
+	Size     int64  `json:"size" minimum:"1" doc:"Input file size in bytes. It must not exceed the configured spool capacity."`
+	SHA256   string `json:"sha256,omitempty" pattern:"^[0-9a-fA-F]{64}$" doc:"Optional hexadecimal SHA-256 checksum for the complete input file."`
 }
 type Request struct {
-	Input  Input  `json:"input"`
-	Output Output `json:"output"`
+	Input  Input  `json:"input" doc:"Input file metadata."`
+	Output Output `json:"output,omitempty" doc:"Optional output selection. Defaults to MP4, H.264, AAC, and source resolution."`
 }
 type Output struct {
-	Preset    string `json:"preset,omitempty"`
-	Container string `json:"container,omitempty"`
-	Video     Video  `json:"video"`
-	Audio     Audio  `json:"audio"`
+	Preset    string `json:"preset,omitempty" enum:"web-1080p,archive-av1" doc:"Optional preset. Explicit output fields override the preset defaults."`
+	Container string `json:"container,omitempty" enum:"mp4,mkv,webm" doc:"Output container. Defaults to mp4."`
+	Video     Video  `json:"video,omitempty" doc:"Video encoding options."`
+	Audio     Audio  `json:"audio,omitempty" doc:"Audio encoding options."`
 }
 type Video struct {
-	Codec      string     `json:"codec,omitempty"`
-	Quality    Quality    `json:"quality"`
-	Resolution Resolution `json:"resolution"`
+	Codec      string     `json:"codec,omitempty" enum:"h264,hevc,av1,vp9" doc:"Video codec. Defaults to h264."`
+	Quality    Quality    `json:"quality,omitempty" doc:"Quality mode. Set value for quality mode or crf for CRF mode."`
+	Resolution Resolution `json:"resolution,omitempty" doc:"Resolution mode. Width and height apply only when mode is fit."`
 }
 type Quality struct {
-	Mode  string `json:"mode,omitempty"`
-	Value int    `json:"value,omitempty"`
-	CRF   int    `json:"crf,omitempty"`
+	Mode  string `json:"mode,omitempty" enum:"quality,crf" doc:"Quality mode. Defaults to quality."`
+	Value int    `json:"value,omitempty" minimum:"0" maximum:"100" doc:"Quality value from 0 through 100. Used only when mode is quality."`
+	CRF   int    `json:"crf,omitempty" minimum:"0" maximum:"63" doc:"Constant rate factor. Used only when mode is crf; h264 and hevc allow 0 through 51, av1 and vp9 allow 0 through 63."`
 }
 type Resolution struct {
-	Mode    string `json:"mode,omitempty"`
-	Width   int    `json:"width,omitempty"`
-	Height  int    `json:"height,omitempty"`
-	Upscale *bool  `json:"upscale,omitempty"`
+	Mode    string `json:"mode,omitempty" enum:"source,fit" doc:"Resolution mode. Defaults to source."`
+	Width   int    `json:"width,omitempty" minimum:"2" doc:"Target width in pixels when mode is fit; must not exceed the configured maximum width."`
+	Height  int    `json:"height,omitempty" minimum:"2" doc:"Target height in pixels when mode is fit; must not exceed the configured maximum height."`
+	Upscale *bool  `json:"upscale,omitempty" doc:"Whether fit mode may enlarge the input. Defaults to false."`
 }
 type Audio struct {
-	Codec       string `json:"codec,omitempty"`
-	BitrateKbps int    `json:"bitrate_kbps,omitempty"`
+	Codec       string `json:"codec,omitempty" enum:"aac,opus,flac" doc:"Audio codec. Defaults to aac."`
+	BitrateKbps int    `json:"bitrate_kbps,omitempty" minimum:"16" maximum:"512" doc:"Audio bitrate in kbps. Defaults to 160."`
 }
 type Job struct {
 	ID, State, Filename, Spec, InputHash, ActualHash string
@@ -149,10 +149,21 @@ func (s *Server) schema() error {
 	return e
 }
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	out(w, 200, map[string]bool{"ok": true})
+	out(w, http.StatusOK, APIHealthResponse{OK: true})
 }
 func (s *Server) cap(w http.ResponseWriter, r *http.Request) {
-	out(w, 200, map[string]any{"containers": []string{"mp4", "mkv", "webm"}, "video_codecs": []string{"h264", "hevc", "av1", "vp9"}, "audio_codecs": []string{"aac", "opus", "flac"}, "presets": []string{"web-1080p", "archive-av1"}, "limits": map[string]any{"chunk_size": s.cfg.Chunk, "max_width": s.cfg.MaxWidth, "max_height": s.cfg.MaxHeight, "max_streams": s.cfg.MaxStreams}})
+	out(w, http.StatusOK, APICapabilitiesResponse{
+		Containers:  []string{"mp4", "mkv", "webm"},
+		VideoCodecs: []string{"h264", "hevc", "av1", "vp9"},
+		AudioCodecs: []string{"aac", "opus", "flac"},
+		Presets:     []string{"web-1080p", "archive-av1"},
+		Limits: APILimits{
+			ChunkSize:  s.cfg.Chunk,
+			MaxWidth:   s.cfg.MaxWidth,
+			MaxHeight:  s.cfg.MaxHeight,
+			MaxStreams: s.cfg.MaxStreams,
+		},
+	})
 }
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var q Request
@@ -228,7 +239,16 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		bad(w, 507, "spool preallocation: "+e.Error())
 		return
 	}
-	out(w, 201, map[string]any{"id": id, "state": created, "reservation_bytes": res, "upload": map[string]any{"mode": "chunked", "chunk_size": s.cfg.Chunk, "required_header": "X-Chunk-SHA256"}})
+	out(w, http.StatusCreated, APICreateJobResponse{
+		ID:               id,
+		State:            created,
+		ReservationBytes: res,
+		Upload: APIUploadInstructions{
+			Mode:           "chunked",
+			ChunkSize:      s.cfg.Chunk,
+			RequiredHeader: "X-Chunk-SHA256",
+		},
+	})
 }
 func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	jid := r.PathValue("id")
@@ -268,7 +288,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	e = s.db.QueryRow(`SELECT sha256 FROM chunks WHERE job_id=? AND number=? AND state='VERIFIED'`, jid, n).Scan(&have)
 	if e == nil {
 		if have == sum {
-			out(w, 200, map[string]any{"chunk": n, "status": "already_present"})
+			out(w, http.StatusOK, APIChunkResponse{Chunk: n, Status: "already_present"})
 			return
 		}
 		bad(w, 409, "chunk already present with different checksum")
@@ -344,7 +364,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, e.Error())
 		return
 	}
-	out(w, 200, map[string]any{"chunk": n, "bytes": want, "status": "verified"})
+	out(w, http.StatusOK, APIChunkResponse{Chunk: n, Bytes: want, Status: "verified"})
 }
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	jid := r.PathValue("id")
@@ -370,14 +390,14 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	if n != 1 {
 		j, z := s.job(jid)
 		if z == nil && (j.State == finalizing || j.State == staged || j.State == probing || j.State == validated || j.State == queued) {
-			out(w, 202, map[string]any{"id": jid, "state": j.State})
+			out(w, http.StatusAccepted, APIJobStateResponse{ID: jid, State: j.State})
 			return
 		}
 		bad(w, 409, "upload incomplete or job not completable")
 		return
 	}
 	go s.finalize(jid)
-	out(w, 202, map[string]any{"id": jid, "state": finalizing})
+	out(w, http.StatusAccepted, APIJobStateResponse{ID: jid, State: finalizing})
 }
 func (s *Server) finalize(jid string) {
 	mu := s.lock(jid, -1)
@@ -455,7 +475,19 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		bad(w, 404, "job not found")
 		return
 	}
-	out(w, 200, map[string]any{"id": j.ID, "state": j.State, "filename": j.Filename, "size": j.Size, "bytes_received": j.Received, "chunks_received": j.Chunks, "chunks_expected": j.Expected, "reservation_bytes": j.Reserved, "input_sha256": j.ActualHash, "error": nullable(j.Error), "output_url": artifactURL(j)})
+	out(w, http.StatusOK, APIJobResponse{
+		ID:               j.ID,
+		State:            j.State,
+		Filename:         j.Filename,
+		Size:             j.Size,
+		BytesReceived:    j.Received,
+		ChunksReceived:   j.Chunks,
+		ChunksExpected:   j.Expected,
+		ReservationBytes: j.Reserved,
+		InputSHA256:      j.ActualHash,
+		Error:            nullable(j.Error),
+		OutputURL:        artifactURL(j),
+	})
 }
 func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 	j, e := s.job(r.PathValue("id"))
@@ -812,15 +844,16 @@ func hashFile(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), e
 }
 func id() string { b := make([]byte, 16); rand.Read(b); return hex.EncodeToString(b) }
-func nullable(v sql.NullString) any {
+func nullable(v sql.NullString) *string {
 	if v.Valid {
-		return v.String
+		return &v.String
 	}
 	return nil
 }
-func artifactURL(j Job) any {
+func artifactURL(j Job) *string {
 	if j.State == completed && j.Artifact.Valid {
-		return "/v1/jobs/" + j.ID + "/output"
+		url := "/v1/jobs/" + j.ID + "/output"
+		return &url
 	}
 	return nil
 }
@@ -852,9 +885,9 @@ func envB(k string, d bool) bool {
 	}
 	return v == "1" || strings.EqualFold(v, "true")
 }
-func out(w http.ResponseWriter, n int, v any) {
+func out[T any](w http.ResponseWriter, n int, v T) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(n)
 	json.NewEncoder(w).Encode(v)
 }
-func bad(w http.ResponseWriter, n int, m string) { out(w, n, map[string]string{"error": m}) }
+func bad(w http.ResponseWriter, n int, m string) { out(w, n, APIError{Error: m}) }
