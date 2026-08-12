@@ -206,21 +206,33 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := s.dir(id)
 	if e = os.MkdirAll(dir, 0750); e != nil {
-		s.cancelReservation(id, res)
+		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
+			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
+			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
+			return
+		}
 		bad(w, 500, e.Error())
 		return
 	}
 	f, e := os.OpenFile(filepath.Join(dir, "input.part"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0640)
 	if e != nil {
 		os.RemoveAll(dir)
-		s.cancelReservation(id, res)
+		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
+			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
+			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
+			return
+		}
 		bad(w, 500, e.Error())
 		return
 	}
 	defer f.Close()
 	if e = unix.Fallocate(int(f.Fd()), 0, 0, q.Input.Size); e != nil {
 		os.RemoveAll(dir)
-		s.cancelReservation(id, res)
+		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
+			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
+			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
+			return
+		}
 		bad(w, 507, "spool preallocation: "+e.Error())
 		return
 	}
@@ -544,16 +556,22 @@ func (s *Server) release(j Job) {
 		}
 	}
 }
-func (s *Server) cancelReservation(id string, res int64) {
+func (s *Server) cancelReservation(id string, res int64) error {
 	tx, e := s.db.Begin()
 	if e != nil {
-		return
+		return e
 	}
 	defer tx.Rollback()
-	tx.Exec(`DELETE FROM reservations WHERE job_id=?`, id)
-	tx.Exec(`DELETE FROM jobs WHERE id=?`, id)
-	tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, res)
-	tx.Commit()
+	if _, e = tx.Exec(`DELETE FROM reservations WHERE job_id=?`, id); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`DELETE FROM jobs WHERE id=?`, id); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, res); e != nil {
+		return e
+	}
+	return tx.Commit()
 }
 func (s *Server) probeCmd(in string) *exec.Cmd {
 	return s.sandbox(nil, in, "", []string{"/usr/bin/ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", in})
