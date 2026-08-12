@@ -78,6 +78,7 @@ const indexHTML = `<!doctype html>
         spec: { url: './openapi.json' },
         theme: 'purple',
         hideClientButton: false,
+        customCss: '.scalar-api-reference .section:first-of-type { padding-top: 32px; }',
       })
     </script>
   </body>
