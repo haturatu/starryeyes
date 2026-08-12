@@ -71,14 +71,14 @@ const indexHTML = `<!doctype html>
     <title>Starryeyes API</title>
   </head>
   <body>
-    <div id="api-reference"></div>
+    <div id="starryeyes-api-reference"></div>
     <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.64.1"></script>
     <script>
-      Scalar.createApiReference('#api-reference', {
+      Scalar.createApiReference('#starryeyes-api-reference', {
         spec: { url: './openapi.json' },
         theme: 'purple',
         hideClientButton: false,
-        customCss: '.scalar-api-reference .section:first-of-type { padding-top: 32px; }',
+        customCss: '.references-developer-tools { display: none !important; } .scalar-api-reference .section:first-of-type { padding-top: 0 !important; }',
       })
     </script>
   </body>

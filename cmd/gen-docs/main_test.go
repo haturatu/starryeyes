@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -44,5 +45,8 @@ func TestGenerate(t *testing.T) {
 	}
 	if string(index) != indexHTML {
 		t.Error("index.html does not contain the expected Scalar site")
+	}
+	if !strings.Contains(string(index), "starryeyes-api-reference") || strings.Contains(string(index), `id="api-reference"`) {
+		t.Error("index.html must use a mount point that does not trigger Scalar's automatic initialization")
 	}
 }
