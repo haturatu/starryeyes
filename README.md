@@ -59,13 +59,15 @@ go run ./cmd/demo-client --file sample.mp4
 
 ## Recursive directory upload
 
-Use [`scripts/upload-directory.sh`](scripts/upload-directory.sh) to submit every supported video file below a directory. It uploads files sequentially, requests the `web-1080p` preset by default, and prints the job ID for each submitted file. When a server queues a job for local spool capacity, the script polls it until upload is admitted; set `ADMISSION_POLL_SECONDS` to change the default 10-second interval.
+Use [`scripts/upload-directory.sh`](scripts/upload-directory.sh) to submit every supported video file below a directory. Files are processed sequentially, while each file uploads up to four missing chunks in parallel. The script requests the `web-1080p` preset by default and waits through admission, processing, and completion.
 
 ```sh
 scripts/upload-directory.sh http://localhost:8080 /path/to/videos
 ```
 
-The script recognises `3gp`, `avi`, `flv`, `m2ts`, `m4v`, `mkv`, `mov`, `mp4`, `mpeg`, `mpg`, `mts`, `ts`, `webm`, and `wmv` extensions case-insensitively. It requires Bash 4+, `curl`, `jq`, `sha256sum`, GNU `stat`, and GNU `dd`. Set `OUTPUT_PRESET=archive-av1` to request that preset instead.
+Before creating a job, the script persists an idempotency key under `${XDG_STATE_HOME:-$HOME/.local/state}/starryeyes/uploads`. If the process or network fails, run the same command again: the key rediscovers the same job, `GET /v1/jobs/<id>/chunks` supplies the server-authoritative verified parts, and only missing chunks are sent. Local state never decides which chunk comes next. It is removed after `COMPLETED`, retained after `FAILED` for inspection, and reset after `EXPIRED` so the next run can start a new workflow.
+
+The script recognises `3gp`, `avi`, `flv`, `m2ts`, `m4v`, `mkv`, `mov`, `mp4`, `mpeg`, `mpg`, `mts`, `ts`, `webm`, and `wmv` extensions case-insensitively. It requires Bash 4+, `curl`, `flock`, `jq`, `realpath`, `sha256sum`, GNU `stat`, `sync`, and `dd`. Set `OUTPUT_PRESET=archive-av1`, `UPLOAD_PARALLELISM=8`, or `STARRYEYES_STATE_DIR=/another/private/path` to override their defaults.
 
 ## Data layout
 
@@ -107,15 +109,19 @@ Invalid or modified artifacts are reported and are never imported. In-progress u
 
 ## Upload and job lifecycle
 
-1. `POST /v1/jobs` always creates a `PENDING` job. It does not return a capacity-exhaustion error.
-2. The server admits pending jobs in FIFO order when local input-spool capacity is available. `GET /v1/jobs/<job-id>` changes to `ADMITTED` and includes `upload` instructions only after the input file has been preallocated.
-3. `PUT /v1/jobs/<job-id>/chunks/<number>` uploads a fixed-size chunk with `X-Chunk-SHA256`.
-4. Repeating a chunk with the same checksum is idempotent; a different checksum returns `409 Conflict`.
-5. `POST /v1/jobs/<job-id>/complete` atomically finalizes the upload.
-6. The server computes the whole-file hash, runs sandboxed `ffprobe`, validates media limits, and queues the job.
-7. The worker runs FFmpeg with a normalized, allowlisted JobSpec.
+1. The client persists a random workflow key, then sends `POST /v1/jobs` with `Idempotency-Key`. The same key and normalized request always return the same job; a different request with that key returns `409 Conflict`.
+2. A new job starts as `PENDING`. The server admits pending jobs in FIFO order when local input-spool capacity is available. `GET /v1/jobs/<job-id>` changes to `ADMITTED` and includes upload instructions only after the input file has been preallocated.
+3. On every resume, the client reads `GET /v1/jobs/<job-id>/chunks`. Its ordered chunk records—not local progress—are the source of truth.
+4. `PUT /v1/jobs/<job-id>/chunks/<number>` uploads independent fixed-size chunks with `X-Chunk-SHA256`, so missing chunks may be sent in parallel. Repeating the same chunk and checksum returns `already_present`; a different checksum returns `409 Conflict`.
+5. `POST /v1/jobs/<job-id>/complete` atomically finalizes a complete upload. Repeating it during finalization, processing, or after `COMPLETED` returns `202 Accepted` with the current state.
+6. The server verifies the whole input SHA-256, runs sandboxed `ffprobe`, validates media limits, and queues the job.
+7. The worker runs FFmpeg with a normalized, allowlisted JobSpec. A server restart requeues an interrupted transcode from the beginning; FFmpeg processing itself is not resumed mid-file.
 
-Job states include `PENDING`, `ADMITTED`, `UPLOADING`, `FINALIZING`, `STAGED`, `PROBING`, `VALIDATED`, `QUEUED`, `TRANSCODING`, `COMPLETED`, and `FAILED`.
+`PENDING`, `ADMITTED`, and `UPLOADING` jobs expire after no upload activity for `UPLOAD_RETENTION` (default `168h`). Expiration changes the state to `EXPIRED`, removes the spool and chunk rows, and releases reserved capacity. Successful chunk PUTs extend the deadline. At startup, resumable jobs are accepted only when `input.part` exists as a regular file with the expected preallocated size; the final whole-file hash remains the integrity gate.
+
+Job states include `PENDING`, `ADMITTED`, `UPLOADING`, `FINALIZING`, `STAGED`, `PROBING`, `VALIDATED`, `QUEUED`, `STARTING`, `TRANSCODING`, `COMPLETED`, `FAILED`, and `EXPIRED`.
+
+This schema intentionally does not migrate databases created before resumable uploads. For an existing installation, stop Starryeyes, preserve the old database if needed, create a fresh `jobs.sqlite`, then use the manifest backfill command above to restore completed outputs. In-progress uploads from the old schema are not recoverable.
 
 ## Security model
 
@@ -136,6 +142,7 @@ OUTPUT_DIR=/mnt/output             # required, absolute, and outside DATA_DIR
 CHUNK_SIZE_BYTES=67108864
 MAX_ACTIVE_TRANSCODES=2
 SPOOL_CAPACITY_BYTES=21474836480
+UPLOAD_RETENTION=168h
 REQUIRE_LANDLOCK=true
 REQUIRE_CGROUP=true       # production; Compose sets false because it has no delegation
 CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
@@ -146,6 +153,7 @@ CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
 ```sh
 go test ./...
 go vet ./...
+bash -n scripts/upload-directory.sh
 go run ./cmd/gen-docs public
 cp .env.example .env
 docker compose config
