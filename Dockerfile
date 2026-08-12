@@ -25,7 +25,7 @@ COPY --from=build /out/starryeyes /usr/local/bin/starryeyes
 COPY --from=build /out/sandbox-exec /usr/local/bin/sandbox-exec
 COPY --from=build /out/cgroup-exec /usr/local/bin/cgroup-exec
 RUN useradd --system --uid 10001 --create-home starryeyes \
- && mkdir -p /var/lib/starryeyes/spool /var/lib/starryeyes/output && chown -R starryeyes:starryeyes /var/lib/starryeyes
+ && mkdir -p /var/lib/starryeyes/spool && chown -R starryeyes:starryeyes /var/lib/starryeyes
 USER starryeyes
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/starryeyes"]

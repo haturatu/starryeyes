@@ -71,7 +71,7 @@ func TestOutputSetsOriginalDownloadFilename(t *testing.T) {
 	server, httpServer := newAPITestServer(t)
 	jobID := "completed-job"
 	artifact := "output.webm"
-	artifactPath := filepath.Join(server.cfg.Data, "output", jobID, artifact)
+	artifactPath := filepath.Join(server.outputDir(jobID), artifact)
 	if err := os.MkdirAll(filepath.Dir(artifactPath), 0750); err != nil {
 		t.Fatal(err)
 	}

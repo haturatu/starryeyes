@@ -159,13 +159,14 @@ const createdState = "CREATED"
 
 func newAPITestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
-	dir := t.TempDir()
-	for _, path := range []string{dir, filepath.Join(dir, "spool"), filepath.Join(dir, "output")} {
+	dataDir := t.TempDir()
+	outputDir := t.TempDir()
+	for _, path := range []string{dataDir, filepath.Join(dataDir, "spool"), outputDir} {
 		if err := os.MkdirAll(path, 0750); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
 	}
-	db, err := sql.Open("sqlite", filepath.Join(dir, "jobs.sqlite?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)"))
+	db, err := sql.Open("sqlite", filepath.Join(dataDir, "jobs.sqlite?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +174,7 @@ func newAPITestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Cleanup(func() { db.Close() })
 	server := &Server{
 		db:  db,
-		cfg: Config{Data: dir, Capacity: 8 << 20, Chunk: 1 << 20, Active: 1, MaxWidth: 7680, MaxHeight: 4320, MaxStreams: 64, MaxDuration: 86400},
+		cfg: Config{Data: dataDir, Output: outputDir, Capacity: 8 << 20, Chunk: 1 << 20, Active: 1, MaxWidth: 7680, MaxHeight: 4320, MaxStreams: 64, MaxDuration: 86400},
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		sem: make(chan struct{}, 1),
 	}

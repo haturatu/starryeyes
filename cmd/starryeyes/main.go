@@ -42,7 +42,7 @@ const (
 )
 
 type Config struct {
-	Data, Listen, Cgroup            string
+	Data, Output, Listen, Cgroup    string
 	Capacity, Chunk                 int64
 	Active                          int
 	RequireCgroup, RequireLandlock  bool
@@ -113,7 +113,10 @@ type Probe struct {
 }
 
 func main() {
-	c := Config{Data: env("DATA_DIR", "/var/lib/starryeyes"), Listen: env("LISTEN_ADDR", ":8080"), Capacity: envI("SPOOL_CAPACITY_BYTES", 2<<40), Chunk: envI("CHUNK_SIZE_BYTES", 64<<20), Active: int(envI("MAX_ACTIVE_TRANSCODES", 2)), Cgroup: os.Getenv("CGROUP_ROOT"), RequireCgroup: envB("REQUIRE_CGROUP", true), RequireLandlock: envB("REQUIRE_LANDLOCK", true), MaxWidth: int(envI("MAX_WIDTH", 7680)), MaxHeight: int(envI("MAX_HEIGHT", 4320)), MaxStreams: int(envI("MAX_STREAMS", 64)), MaxDuration: float64(envI("MAX_DURATION_SECONDS", 86400))}
+	c, e := configFromEnv()
+	if e != nil {
+		stdlog.Fatal(e)
+	}
 	if c.Chunk < 1<<20 || c.Active < 1 {
 		stdlog.Fatal("invalid config")
 	}
@@ -127,7 +130,7 @@ func main() {
 			stdlog.Fatalf("Landlock ABI >=4 is required: %v", e)
 		}
 	}
-	for _, d := range []string{c.Data, filepath.Join(c.Data, "spool"), filepath.Join(c.Data, "output")} {
+	for _, d := range []string{c.Data, filepath.Join(c.Data, "spool"), c.Output} {
 		if e := os.MkdirAll(d, 0750); e != nil {
 			stdlog.Fatal(e)
 		}
@@ -506,7 +509,7 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{
 		"filename": downloadFilename(j),
 	}))
-	http.ServeFile(w, r, filepath.Join(s.cfg.Data, "output", j.ID, name))
+	http.ServeFile(w, r, filepath.Join(s.outputDir(j.ID), name))
 }
 func (s *Server) job(id string) (Job, error) {
 	var j Job
@@ -565,7 +568,7 @@ func (s *Server) run(jid string) {
 		s.fail(jid, e)
 		return
 	}
-	dir := filepath.Join(s.cfg.Data, "output", jid)
+	dir := s.outputDir(jid)
 	if e = os.MkdirAll(dir, 0750); e != nil {
 		s.fail(jid, e)
 		return
@@ -626,7 +629,7 @@ func (s *Server) probeCmd(in string) *exec.Cmd {
 }
 func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string) *exec.Cmd {
 	in := filepath.Join(s.dir(j.ID), "input")
-	outDir := filepath.Join(s.cfg.Data, "output", j.ID)
+	outDir := s.outputDir(j.ID)
 	a := []string{"/usr/bin/ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-protocol_whitelist", "file,pipe", "-i", in, "-map", "0:v:0?", "-map", "0:a?", "-c:v", encoder(o.Video.Codec), "-crf", strconv.Itoa(crf(o.Video)), "-pix_fmt", "yuv420p", "-c:a", audio(o.Audio.Codec), "-b:a", strconv.Itoa(o.Audio.BitrateKbps) + "k"}
 	if f := scale(o.Video.Resolution); f != "" {
 		a = append(a, "-vf", f)
@@ -651,7 +654,8 @@ func (s *Server) sandbox(c *cgroup, in, output string, program []string) *exec.C
 	args = append(args, program...)
 	return exec.Command("/usr/local/bin/cgroup-exec", args...)
 }
-func (s *Server) dir(id string) string { return filepath.Join(s.cfg.Data, "spool", id) }
+func (s *Server) dir(id string) string       { return filepath.Join(s.cfg.Data, "spool", id) }
+func (s *Server) outputDir(id string) string { return filepath.Join(s.cfg.Output, id) }
 func (s *Server) chunkBytes(size int64, n int) int64 {
 	v := size - int64(n)*s.cfg.Chunk
 	if v < s.cfg.Chunk {
@@ -837,7 +841,7 @@ func reservation(n int64, o Output) (int64, int64, int64) {
 	}
 	out := n * factor / 100
 	safety := out / 10
-	return out, safety, n + out + safety
+	return out, safety, n
 }
 func hashFile(p string) (string, error) {
 	f, e := os.Open(p)
@@ -895,6 +899,35 @@ func env(k, d string) string {
 		return v
 	}
 	return d
+}
+func configFromEnv() (Config, error) {
+	dataDir := env("DATA_DIR", "/var/lib/starryeyes")
+	outputDir := os.Getenv("OUTPUT_DIR")
+	if e := validateOutputDir(dataDir, outputDir); e != nil {
+		return Config{}, e
+	}
+	return Config{Data: dataDir, Output: outputDir, Listen: env("LISTEN_ADDR", ":8080"), Capacity: envI("SPOOL_CAPACITY_BYTES", 2<<40), Chunk: envI("CHUNK_SIZE_BYTES", 64<<20), Active: int(envI("MAX_ACTIVE_TRANSCODES", 2)), Cgroup: os.Getenv("CGROUP_ROOT"), RequireCgroup: envB("REQUIRE_CGROUP", true), RequireLandlock: envB("REQUIRE_LANDLOCK", true), MaxWidth: int(envI("MAX_WIDTH", 7680)), MaxHeight: int(envI("MAX_HEIGHT", 4320)), MaxStreams: int(envI("MAX_STREAMS", 64)), MaxDuration: float64(envI("MAX_DURATION_SECONDS", 86400))}, nil
+}
+func validateOutputDir(dataDir, outputDir string) error {
+	if outputDir == "" {
+		return errors.New("OUTPUT_DIR is required")
+	}
+	if !filepath.IsAbs(outputDir) {
+		return errors.New("OUTPUT_DIR must be an absolute path")
+	}
+	dataPath, e := filepath.Abs(dataDir)
+	if e != nil {
+		return fmt.Errorf("resolve DATA_DIR: %w", e)
+	}
+	outputPath := filepath.Clean(outputDir)
+	rel, e := filepath.Rel(dataPath, outputPath)
+	if e != nil {
+		return fmt.Errorf("compare DATA_DIR and OUTPUT_DIR: %w", e)
+	}
+	if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+		return errors.New("OUTPUT_DIR must be outside DATA_DIR")
+	}
+	return nil
 }
 func envI(k string, d int64) int64 {
 	if v, e := strconv.ParseInt(os.Getenv(k), 10, 64); e == nil && v > 0 {
