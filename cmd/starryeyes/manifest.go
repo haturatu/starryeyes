@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"syscall"
 	"time"
 )
 
@@ -35,8 +37,10 @@ type OutputManifest struct {
 }
 
 type backfillResult struct {
-	Found, Imported, Updated, Existing, Invalid int
+	Found, Imported, Updated, Existing, Conflicts, Invalid int
 }
+
+var errCompletedManifestConflict = errors.New("completed job conflicts with output manifest")
 
 func (s *Server) writeOutputManifest(j Job, output Output, artifact string, completedAt time.Time) error {
 	if j.CreatedAt == "" || j.ActualHash == "" {
@@ -114,12 +118,28 @@ func writeJSONAtomically(path string, value any) error {
 	if err = os.Rename(tmpName, path); err != nil {
 		return err
 	}
+	return syncDirectory(dir, (*os.File).Sync)
+}
+
+// syncDirectory persists the rename on filesystems that support directory
+// fsync. Some FUSE filesystems report EINVAL or EOPNOTSUPP for it; the
+// already-synced manifest file and rename remain valid, so those two errors
+// are explicitly best-effort rather than making a completed transcode fail.
+func syncDirectory(dir string, sync func(*os.File) error) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
 	defer d.Close()
-	return d.Sync()
+	if err := sync(d); err != nil && !directorySyncUnsupported(err) {
+		return err
+	}
+	return nil
+}
+
+func directorySyncUnsupported(err error) bool {
+	// ENOTSUP is an alias for EOPNOTSUPP on Linux.
+	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EOPNOTSUPP)
 }
 
 func runBackfill(cfg Config) error {
@@ -139,7 +159,7 @@ func runBackfill(cfg Config) error {
 		return err
 	}
 	result, err := server.backfillOutputManifests()
-	server.log.Info("output manifest backfill complete", "found", result.Found, "imported", result.Imported, "updated", result.Updated, "existing", result.Existing, "invalid", result.Invalid)
+	server.log.Info("output manifest backfill complete", "found", result.Found, "imported", result.Imported, "updated", result.Updated, "existing", result.Existing, "conflicts", result.Conflicts, "invalid", result.Invalid)
 	return err
 }
 
@@ -173,6 +193,11 @@ func (s *Server) backfillOutputManifests() (backfillResult, error) {
 		}
 		status, err := s.importOutputManifest(manifest)
 		if err != nil {
+			if errors.Is(err, errCompletedManifestConflict) {
+				result.Conflicts++
+				s.log.Error("completed job conflicts with output manifest", "path", manifestPath, "error", err)
+				continue
+			}
 			result.Invalid++
 			s.log.Error("import output manifest", "path", manifestPath, "error", err)
 			continue
@@ -182,12 +207,12 @@ func (s *Server) backfillOutputManifests() (backfillResult, error) {
 			result.Imported++
 		case "updated":
 			result.Updated++
-		case "existing":
+		case "existing_identical":
 			result.Existing++
 		}
 	}
-	if result.Invalid > 0 {
-		return result, fmt.Errorf("backfill completed with %d invalid manifest(s)", result.Invalid)
+	if result.Invalid > 0 || result.Conflicts > 0 {
+		return result, fmt.Errorf("backfill completed with %d invalid manifest(s) and %d completed-job conflict(s)", result.Invalid, result.Conflicts)
 	}
 	return result, nil
 }
@@ -255,16 +280,18 @@ func (s *Server) importOutputManifest(manifest OutputManifest) (string, error) {
 		return "", err
 	}
 	defer tx.Rollback()
-	var state string
-	var reserved int64
-	err = tx.QueryRow(`SELECT state,reserved FROM jobs WHERE id=?`, manifest.JobID).Scan(&state, &reserved)
-	if err == nil && state == completed {
-		return "existing", tx.Commit()
+	var existing manifestJob
+	err = tx.QueryRow(`SELECT state,filename,size,received,chunks,expected,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,COALESCE(error,''),COALESCE(artifact,''),created_at,COALESCE(finished_at,'') FROM jobs WHERE id=?`, manifest.JobID).Scan(&existing.State, &existing.Filename, &existing.Size, &existing.Received, &existing.Chunks, &existing.Expected, &existing.Spec, &existing.InputHash, &existing.ActualHash, &existing.Reserved, &existing.Error, &existing.Artifact, &existing.CreatedAt, &existing.FinishedAt)
+	if err == nil && existing.State == completed {
+		if !existing.matchesManifest(manifest, expected) {
+			return "existing_conflict", errCompletedManifestConflict
+		}
+		return "existing_identical", tx.Commit()
 	}
 	if err != nil && err != sql.ErrNoRows {
 		return "", err
 	}
-	if state == "" {
+	if existing.State == "" {
 		_, err = tx.Exec(`INSERT INTO jobs(id,state,filename,size,received,chunks,expected,spec,input_hash,actual_hash,reserved,artifact,created_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, manifest.JobID, completed, manifest.OriginalFilename, manifest.InputSize, manifest.InputSize, expected, expected, string(spec), manifest.RequestedInputSHA256, manifest.InputSHA256, 0, manifest.Artifact, manifest.CreatedAt, manifest.CompletedAt)
 		if err != nil {
 			return "", err
@@ -274,8 +301,11 @@ func (s *Server) importOutputManifest(manifest OutputManifest) (string, error) {
 	if _, err = tx.Exec(`DELETE FROM reservations WHERE job_id=?`, manifest.JobID); err != nil {
 		return "", err
 	}
-	if reserved > 0 {
-		if _, err = tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, reserved); err != nil {
+	if _, err = tx.Exec(`DELETE FROM chunks WHERE job_id=?`, manifest.JobID); err != nil {
+		return "", err
+	}
+	if existing.Reserved > 0 {
+		if _, err = tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, existing.Reserved); err != nil {
 			return "", err
 		}
 	}
@@ -284,6 +314,36 @@ func (s *Server) importOutputManifest(manifest OutputManifest) (string, error) {
 		return "", err
 	}
 	return "updated", tx.Commit()
+}
+
+type manifestJob struct {
+	State, Filename, Spec, InputHash, ActualHash, Error, Artifact, CreatedAt, FinishedAt string
+	Size, Received, Reserved                                                             int64
+	Chunks, Expected                                                                     int
+}
+
+func (j manifestJob) matchesManifest(manifest OutputManifest, expected int) bool {
+	if j.Filename != manifest.OriginalFilename || j.Size != manifest.InputSize || j.Received != manifest.InputSize || j.Chunks != expected || j.Expected != expected || j.InputHash != manifest.RequestedInputSHA256 || j.ActualHash != manifest.InputSHA256 || j.Reserved != 0 || j.Error != "" || j.Artifact != manifest.Artifact {
+		return false
+	}
+	var output Output
+	if err := json.Unmarshal([]byte(j.Spec), &output); err != nil || !reflect.DeepEqual(output, manifest.Output) {
+		return false
+	}
+	createdAt, err := parseDatabaseTime(j.CreatedAt)
+	if err != nil {
+		return false
+	}
+	manifestCreatedAt, err := time.Parse(time.RFC3339Nano, manifest.CreatedAt)
+	if err != nil || !createdAt.Equal(manifestCreatedAt) {
+		return false
+	}
+	finishedAt, err := parseDatabaseTime(j.FinishedAt)
+	if err != nil {
+		return false
+	}
+	manifestFinishedAt, err := time.Parse(time.RFC3339Nano, manifest.CompletedAt)
+	return err == nil && finishedAt.Equal(manifestFinishedAt)
 }
 
 func validJobID(id string) bool {

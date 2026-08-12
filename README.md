@@ -90,9 +90,9 @@ GET /v1/jobs/<job-id>/output
 
 ### Database recovery
 
-Each completed output directory includes an atomically written `manifest.json`. It records the original filename, normalized output specification, timestamps, input/output sizes, and SHA-256 checksums. The manifest is written before the job is marked `COMPLETED`, so a completed artifact always has the metadata needed to restore it.
+Each completed output directory includes an atomically written `manifest.json`. It records the original filename, normalized output specification, timestamps, input/output sizes, and SHA-256 checksums. The manifest is written before the job is marked `COMPLETED`, so a completed artifact always has the metadata needed to restore it. Its file data is fsynced before its atomic rename. The post-rename directory fsync is also required where supported; FUSE filesystems that explicitly report `EINVAL` or `EOPNOTSUPP` for directory fsync are accepted, but cannot offer the same crash-durability guarantee for the rename.
 
-If `jobs.sqlite` is lost, stop the daemon and run the binary with `backfill`. It scans `OUTPUT_DIR/*/manifest.json`, verifies every artifact's size and SHA-256 checksum, and recreates completed job records. It is idempotent and skips jobs that are already completed.
+If `jobs.sqlite` is lost, stop the daemon and run the binary with `backfill`. It scans `OUTPUT_DIR/*/manifest.json`, verifies every artifact's size and SHA-256 checksum, and recreates completed job records. It is idempotent for a matching completed job. If an existing completed database record differs from its manifest, backfill reports a conflict and leaves that record untouched.
 
 ```sh
 # Do not run while the daemon is using the same database.
