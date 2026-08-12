@@ -59,41 +59,6 @@ type Server struct {
 	admissionMu sync.Mutex
 	locks       sync.Map
 }
-type Input struct {
-	Filename string `json:"filename" minLength:"1" doc:"Basename of the uploaded media file. It must be 255 bytes or fewer and contain no path separators or control characters."`
-	Size     int64  `json:"size" minimum:"1" doc:"Input file size in bytes. It must not exceed the configured spool capacity."`
-	SHA256   string `json:"sha256,omitempty" pattern:"^[0-9a-fA-F]{64}$" doc:"Optional hexadecimal SHA-256 checksum for the complete input file."`
-}
-type Request struct {
-	Input  Input  `json:"input" doc:"Input file metadata."`
-	Output Output `json:"output,omitempty" doc:"Optional output selection. Defaults to MP4, H.264, AAC, and source resolution."`
-}
-type Output struct {
-	Preset    string `json:"preset,omitempty" enum:"web-1080p,archive-av1" doc:"Optional preset. Explicit output fields override the preset defaults."`
-	Container string `json:"container,omitempty" enum:"mp4,mkv,webm" doc:"Output container. Defaults to mp4."`
-	Video     Video  `json:"video,omitempty" doc:"Video encoding options."`
-	Audio     Audio  `json:"audio,omitempty" doc:"Audio encoding options."`
-}
-type Video struct {
-	Codec      string     `json:"codec,omitempty" enum:"h264,hevc,av1,vp9" doc:"Video codec. Defaults to h264."`
-	Quality    Quality    `json:"quality,omitempty" doc:"Quality mode. Set value for quality mode or crf for CRF mode."`
-	Resolution Resolution `json:"resolution,omitempty" doc:"Resolution mode. Width and height apply only when mode is fit."`
-}
-type Quality struct {
-	Mode  string `json:"mode,omitempty" enum:"quality,crf" doc:"Quality mode. Defaults to quality."`
-	Value int    `json:"value,omitempty" minimum:"0" maximum:"100" doc:"Quality value from 0 through 100. Used only when mode is quality."`
-	CRF   int    `json:"crf,omitempty" minimum:"0" maximum:"63" doc:"Constant rate factor. Used only when mode is crf; h264 and hevc allow 0 through 51, av1 and vp9 allow 0 through 63."`
-}
-type Resolution struct {
-	Mode    string `json:"mode,omitempty" enum:"source,fit" doc:"Resolution mode. Defaults to source."`
-	Width   int    `json:"width,omitempty" minimum:"2" doc:"Target width in pixels when mode is fit; must not exceed the configured maximum width."`
-	Height  int    `json:"height,omitempty" minimum:"2" doc:"Target height in pixels when mode is fit; must not exceed the configured maximum height."`
-	Upscale *bool  `json:"upscale,omitempty" doc:"Whether fit mode may enlarge the input. Defaults to false."`
-}
-type Audio struct {
-	Codec       string `json:"codec,omitempty" enum:"aac,opus,flac" doc:"Audio codec. Defaults to aac."`
-	BitrateKbps int    `json:"bitrate_kbps,omitempty" minimum:"16" maximum:"512" doc:"Audio bitrate in kbps. Defaults to 160."`
-}
 type Job struct {
 	ID, State, Filename, Spec, InputHash, ActualHash string
 	Size, Received, Reserved                         int64

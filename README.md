@@ -4,6 +4,12 @@
 
 The public API accepts a validated, high-level output specification. It never accepts arbitrary FFmpeg arguments or shell commands.
 
+## API documentation
+
+The live server publishes OpenAPI at `/openapi.json` and interactive documentation at `/docs`. The same API definition is generated during CI and published at [haturatu.github.io/starryeyes](https://haturatu.github.io/starryeyes/) after changes reach `main`.
+
+The static documentation deliberately uses `http://localhost:8080` as its example server. Replace it in the UI with the URL of your own self-hosted Starryeyes instance before making requests.
+
 ## Quick start with Docker Compose
 
 The Compose service uses distinct host paths for local job metadata/input spool and completed output. Copy `.env.example` to `.env` and set `OUTPUT_DIR_HOST`; it is the only required Compose variable. Every other entry is optional and has an explicit fallback in `compose.yaml`. Docker Compose automatically reads `.env` next to `compose.yaml`; `DATA_DIR_HOST` and `OUTPUT_DIR_HOST` are used only as host-side bind-mount sources and are not passed into the container.
@@ -121,6 +127,7 @@ CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
 ```sh
 go test ./...
 go vet ./...
+go run ./cmd/gen-docs public
 cp .env.example .env
 docker compose config
 docker compose up --build
