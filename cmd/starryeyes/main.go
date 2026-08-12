@@ -175,22 +175,6 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	id := id()
 	outEstimate, safety, res := reservation(q.Input.Size, sp)
-	dir := s.dir(id)
-	if e = os.MkdirAll(dir, 0750); e != nil {
-		bad(w, 500, e.Error())
-		return
-	}
-	f, e := os.OpenFile(filepath.Join(dir, "input.part"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0640)
-	if e != nil {
-		bad(w, 500, e.Error())
-		return
-	}
-	defer f.Close()
-	if e = unix.Fallocate(int(f.Fd()), 0, 0, q.Input.Size); e != nil {
-		os.Remove(filepath.Join(dir, "input.part"))
-		bad(w, 507, "spool preallocation: "+e.Error())
-		return
-	}
 	b, _ := json.Marshal(sp)
 	tx, e := s.db.Begin()
 	if e != nil {
@@ -218,6 +202,38 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	if e != nil {
 		bad(w, 500, e.Error())
+		return
+	}
+	dir := s.dir(id)
+	if e = os.MkdirAll(dir, 0750); e != nil {
+		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
+			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
+			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
+			return
+		}
+		bad(w, 500, e.Error())
+		return
+	}
+	f, e := os.OpenFile(filepath.Join(dir, "input.part"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0640)
+	if e != nil {
+		os.RemoveAll(dir)
+		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
+			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
+			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
+			return
+		}
+		bad(w, 500, e.Error())
+		return
+	}
+	defer f.Close()
+	if e = unix.Fallocate(int(f.Fd()), 0, 0, q.Input.Size); e != nil {
+		os.RemoveAll(dir)
+		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
+			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
+			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
+			return
+		}
+		bad(w, 507, "spool preallocation: "+e.Error())
 		return
 	}
 	out(w, 201, map[string]any{"id": id, "state": created, "reservation_bytes": res, "upload": map[string]any{"mode": "chunked", "chunk_size": s.cfg.Chunk, "required_header": "X-Chunk-SHA256"}})
@@ -548,6 +564,23 @@ func (s *Server) release(j Job) {
 			s.db.Exec(`DELETE FROM reservations WHERE job_id=?`, j.ID)
 		}
 	}
+}
+func (s *Server) cancelReservation(id string, res int64) error {
+	tx, e := s.db.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if _, e = tx.Exec(`DELETE FROM reservations WHERE job_id=?`, id); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`DELETE FROM jobs WHERE id=?`, id); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, res); e != nil {
+		return e
+	}
+	return tx.Commit()
 }
 func (s *Server) probeCmd(in string) *exec.Cmd {
 	return s.sandbox(nil, in, "", []string{"/usr/bin/ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", in})
