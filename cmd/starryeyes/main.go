@@ -333,8 +333,17 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 	_, e = tx.Exec(`INSERT INTO chunks(job_id,number,bytes,sha256,state) VALUES(?,?,?,?, 'VERIFIED')`, jid, n, want, sum)
+	var updated int64
 	if e == nil {
-		_, e = tx.Exec(`UPDATE jobs SET state=?,received=received+?,chunks=chunks+1 WHERE id=? AND state IN (?,?)`, uploading, want, jid, created, uploading)
+		var x sql.Result
+		x, e = tx.Exec(`UPDATE jobs SET state=?,received=received+?,chunks=chunks+1 WHERE id=? AND state IN (?,?)`, uploading, want, jid, created, uploading)
+		if e == nil {
+			updated, _ = x.RowsAffected()
+		}
+	}
+	if e == nil && updated != 1 {
+		bad(w, 409, "job is not accepting upload")
+		return
 	}
 	if e == nil {
 		e = tx.Commit()
