@@ -139,15 +139,7 @@ func main() {
 		stdlog.Fatal(e)
 	}
 	go s.recover()
-	m := http.NewServeMux()
-	m.HandleFunc("GET /healthz", s.health)
-	m.HandleFunc("GET /v1/capabilities", s.cap)
-	m.HandleFunc("POST /v1/jobs", s.create)
-	m.HandleFunc("PUT /v1/jobs/{id}/chunks/{chunk}", s.chunk)
-	m.HandleFunc("POST /v1/jobs/{id}/complete", s.complete)
-	m.HandleFunc("GET /v1/jobs/{id}", s.get)
-	m.HandleFunc("GET /v1/jobs/{id}/output", s.output)
-	h := http.MaxBytesHandler(m, c.Chunk+8192)
+	h := http.MaxBytesHandler(newRouter(s), c.Chunk+8192)
 	srv := &http.Server{Addr: c.Listen, Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second}
 	s.log.Info("listening", "address", c.Listen)
 	stdlog.Fatal(srv.ListenAndServe())
