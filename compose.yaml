@@ -4,7 +4,8 @@ services:
     ports: ["8080:8080"]
     environment:
       DATA_DIR: /var/lib/starryeyes
-      SPOOL_CAPACITY_BYTES: "21474836480" # 20 GiB: admission-control reservation budget
+      OUTPUT_DIR: /mnt/output
+      SPOOL_CAPACITY_BYTES: "21474836480" # 20 GiB: local input-spool admission-control budget
       CHUNK_SIZE_BYTES: "67108864"         # 64 MiB
       MAX_ACTIVE_TRANSCODES: "2"
       CGROUP_ROOT: ""
@@ -14,6 +15,9 @@ services:
       - type: bind
         source: /var/lib/starryeyes
         target: /var/lib/starryeyes
+      - type: bind
+        source: ${OUTPUT_DIR_HOST:?set OUTPUT_DIR_HOST to the host output directory}
+        target: /mnt/output
     security_opt:
       - no-new-privileges:true
     cap_drop: ["ALL"]

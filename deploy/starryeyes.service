@@ -7,6 +7,7 @@ User=starryeyes
 Group=starryeyes
 ExecStart=/usr/local/bin/starryeyes
 Environment=DATA_DIR=/var/lib/starryeyes
+Environment=OUTPUT_DIR=/mnt/starryeyes-output
 Environment=CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
 Environment=REQUIRE_CGROUP=true
 Environment=REQUIRE_LANDLOCK=true
@@ -29,7 +30,7 @@ RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-ReadWritePaths=/var/lib/starryeyes
+ReadWritePaths=/var/lib/starryeyes /mnt/starryeyes-output
 Restart=on-failure
 
 [Install]

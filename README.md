@@ -6,10 +6,13 @@ The public API accepts a validated, high-level output specification. It never ac
 
 ## Quick start with Docker Compose
 
-The Compose service is named `starryeyes` and uses a host bind mount at `/var/lib/starryeyes`:
+The Compose service uses distinct host paths for local job metadata/input spool and completed output. `OUTPUT_DIR_HOST` is required, must exist, and must be writable by UID `10001`; it should point to the mounted output storage, for example an rclone FUSE mount:
 
 ```sh
 sudo install -d -o 10001 -g 999 -m 0750 /var/lib/starryeyes
+rclone mount remote:starryeyes /mnt/remote-output/starryeyes --allow-other --vfs-cache-mode writes
+export OUTPUT_DIR_HOST=/mnt/remote-output/starryeyes
+docker compose config
 docker compose up --build
 ```
 
@@ -21,7 +24,7 @@ Inspect the service and data from the host or container:
 docker compose ps
 docker compose exec starryeyes ls -la /var/lib/starryeyes
 sudo ls -la /var/lib/starryeyes/spool
-sudo ls -la /var/lib/starryeyes/output
+sudo ls -la "$OUTPUT_DIR_HOST"
 ```
 
 Upload a sample file with the included client:
@@ -32,13 +35,15 @@ go run ./cmd/demo-client --file sample.mp4
 
 ## Data layout
 
-The default data directory is `/var/lib/starryeyes`.
+`DATA_DIR` stores durable metadata and the local input spool. `OUTPUT_DIR` is required, must be an absolute path outside `DATA_DIR`, and stores completed artifacts. The Compose configuration mounts `OUTPUT_DIR_HOST` at `/mnt/output` and sets `OUTPUT_DIR=/mnt/output`.
 
 ```text
 /var/lib/starryeyes/
 ├── jobs.sqlite
-├── spool/<job-id>/input
-└── output/<job-id>/output.<container>
+└── spool/<job-id>/input
+
+/mnt/output/
+└── <job-id>/output.<container>
 ```
 
 The output artifact is available through:
@@ -49,7 +54,7 @@ GET /v1/jobs/<job-id>/output
 
 ## Upload and job lifecycle
 
-1. `POST /v1/jobs` creates a job and reserves input/output capacity.
+1. `POST /v1/jobs` creates a job and reserves local input-spool capacity. Output estimates remain job metadata; output capacity is not yet admission-controlled.
 2. `PUT /v1/jobs/<job-id>/chunks/<number>` uploads a fixed-size chunk with `X-Chunk-SHA256`.
 3. Repeating a chunk with the same checksum is idempotent; a different checksum returns `409 Conflict`.
 4. `POST /v1/jobs/<job-id>/complete` atomically finalizes the upload.
@@ -73,6 +78,7 @@ Important environment variables include:
 
 ```text
 DATA_DIR=/var/lib/starryeyes
+OUTPUT_DIR=/mnt/output             # required, absolute, and outside DATA_DIR
 CHUNK_SIZE_BYTES=67108864
 MAX_ACTIVE_TRANSCODES=2
 SPOOL_CAPACITY_BYTES=21474836480
@@ -86,6 +92,6 @@ CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
 ```sh
 go test ./...
 go vet ./...
-docker compose config
+OUTPUT_DIR_HOST=/mnt/remote-output/starryeyes docker compose config
 docker compose up --build
 ```
