@@ -6,12 +6,13 @@ The public API accepts a validated, high-level output specification. It never ac
 
 ## Quick start with Docker Compose
 
-The Compose service uses distinct host paths for local job metadata/input spool and completed output. `OUTPUT_DIR_HOST` is required, must exist, and must be writable by UID `10001`; it should point to the mounted output storage, for example an rclone FUSE mount:
+The Compose service uses distinct host paths for local job metadata/input spool and completed output. Copy `.env.example` to `.env` and set `OUTPUT_DIR_HOST` to an existing path writable by UID `10001`. Docker Compose automatically reads `.env` next to `compose.yaml` for variable interpolation; `OUTPUT_DIR_HOST` is used only as the host-side bind-mount source and is not passed into the container.
 
 ```sh
 sudo install -d -o 10001 -g 999 -m 0750 /var/lib/starryeyes
 rclone mount remote:starryeyes /mnt/remote-output/starryeyes --allow-other --vfs-cache-mode writes
-export OUTPUT_DIR_HOST=/mnt/remote-output/starryeyes
+cp .env.example .env
+# Edit .env if your output path differs.
 docker compose config
 docker compose up --build
 ```
@@ -24,7 +25,7 @@ Inspect the service and data from the host or container:
 docker compose ps
 docker compose exec starryeyes ls -la /var/lib/starryeyes
 sudo ls -la /var/lib/starryeyes/spool
-sudo ls -la "$OUTPUT_DIR_HOST"
+sudo ls -la "$(sed -n 's/^OUTPUT_DIR_HOST=//p' .env)"
 ```
 
 Upload a sample file with the included client:
@@ -92,6 +93,7 @@ CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
 ```sh
 go test ./...
 go vet ./...
-OUTPUT_DIR_HOST=/mnt/remote-output/starryeyes docker compose config
+cp .env.example .env
+docker compose config
 docker compose up --build
 ```
