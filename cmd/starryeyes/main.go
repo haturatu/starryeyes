@@ -148,7 +148,7 @@ func main() {
 	m.HandleFunc("GET /v1/jobs/{id}", s.get)
 	m.HandleFunc("GET /v1/jobs/{id}/output", s.output)
 	h := http.MaxBytesHandler(m, c.Chunk+8192)
-	srv := &http.Server{Addr: c.Listen, Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second}
+	srv := &http.Server{Addr: c.Listen, Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second}
 	s.log.Info("listening", "address", c.Listen)
 	stdlog.Fatal(srv.ListenAndServe())
 }
@@ -229,10 +229,19 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		bad(w, 400, "invalid chunk")
 		return
 	}
+	j, e := s.job(jid)
+	if e != nil {
+		bad(w, 404, "job not found")
+		return
+	}
+	if n >= j.Expected {
+		bad(w, 416, "chunk outside input")
+		return
+	}
 	mu := s.lock(jid, n)
 	mu.Lock()
 	defer mu.Unlock()
-	j, e := s.job(jid)
+	j, e = s.job(jid)
 	if e != nil {
 		bad(w, 404, "job not found")
 		return
