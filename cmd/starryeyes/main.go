@@ -782,6 +782,9 @@ func artifactURL(j Job) any {
 	return nil
 }
 func truncate(x string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	if len(x) > n {
 		return x[:n]
 	}
