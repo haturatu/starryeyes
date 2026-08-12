@@ -13,6 +13,7 @@ import (
 	"io"
 	stdlog "log"
 	"log/slog"
+	"mime"
 	_ "modernc.org/sqlite"
 	"net/http"
 	"os"
@@ -22,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -55,7 +58,7 @@ type Server struct {
 	locks      sync.Map
 }
 type Input struct {
-	Filename string `json:"filename" minLength:"1" doc:"Basename of the uploaded media file; path separators are not allowed."`
+	Filename string `json:"filename" minLength:"1" doc:"Basename of the uploaded media file. It must be 255 bytes or fewer and contain no path separators or control characters."`
 	Size     int64  `json:"size" minimum:"1" doc:"Input file size in bytes. It must not exceed the configured spool capacity."`
 	SHA256   string `json:"sha256,omitempty" pattern:"^[0-9a-fA-F]{64}$" doc:"Optional hexadecimal SHA-256 checksum for the complete input file."`
 }
@@ -500,6 +503,9 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, "invalid artifact key")
 		return
 	}
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{
+		"filename": downloadFilename(j),
+	}))
 	http.ServeFile(w, r, filepath.Join(s.cfg.Data, "output", j.ID, name))
 }
 func (s *Server) job(id string) (Job, error) {
@@ -694,7 +700,7 @@ func (c cgroup) cleanup() {
 	_ = os.Remove(c.path)
 }
 func normalize(r Request, c Config) (Output, error) {
-	if r.Input.Size <= 0 || r.Input.Size > c.Capacity || filepath.Base(r.Input.Filename) != r.Input.Filename {
+	if r.Input.Size <= 0 || r.Input.Size > c.Capacity || validateFilename(r.Input.Filename) != nil {
 		return Output{}, errors.New("invalid input")
 	}
 	if r.Input.SHA256 != "" && len(r.Input.SHA256) != 64 {
@@ -844,6 +850,24 @@ func hashFile(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), e
 }
 func id() string { b := make([]byte, 16); rand.Read(b); return hex.EncodeToString(b) }
+func validateFilename(name string) error {
+	if name == "" || name == "." || name == ".." || len(name) > 255 || !utf8.ValidString(name) || filepath.Base(name) != name || strings.Contains(name, `\`) {
+		return errors.New("invalid filename")
+	}
+	for _, r := range name {
+		if r == 0 || unicode.IsControl(r) {
+			return errors.New("invalid filename")
+		}
+	}
+	return nil
+}
+func downloadFilename(j Job) string {
+	base := strings.TrimSuffix(j.Filename, filepath.Ext(j.Filename))
+	if base == "" {
+		base = j.Filename
+	}
+	return base + filepath.Ext(j.Artifact.String)
+}
 func nullable(v sql.NullString) *string {
 	if v.Valid {
 		return &v.String
