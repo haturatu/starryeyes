@@ -124,7 +124,9 @@ func main() {
 	if e = s.schema(); e != nil {
 		stdlog.Fatal(e)
 	}
-	s.recover()
+	if e = s.recover(); e != nil {
+		stdlog.Fatal(e)
+	}
 	go s.runUploadGC()
 	h := http.MaxBytesHandler(newRouter(s), c.Chunk+8192)
 	srv := &http.Server{Addr: c.Listen, Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second}
@@ -633,21 +635,40 @@ func (s *Server) job(id string) (Job, error) {
 	e := s.db.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,chunk_size,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact,created_at,expires_at FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.State, &j.Filename, &j.Size, &j.Received, &j.Chunks, &j.Expected, &j.ChunkSize, &j.Spec, &j.InputHash, &j.ActualHash, &j.Reserved, &j.Error, &j.Artifact, &j.CreatedAt, &j.ExpiresAt)
 	return j, e
 }
-func (s *Server) recover() {
-	s.expireUploads(time.Now().UTC())
-	s.reconcileResumableUploads()
-	s.db.Exec(`UPDATE jobs SET state=? WHERE state IN (?,?)`, queued, starting, transcoding)
+func (s *Server) recover() error {
+	if e := s.expireUploads(time.Now().UTC()); e != nil {
+		return e
+	}
+	if e := s.reconcileResumableUploads(); e != nil {
+		return e
+	}
+	if _, e := s.db.Exec(`UPDATE jobs SET state=? WHERE state IN (?,?)`, queued, starting, transcoding); e != nil {
+		return e
+	}
 	rows, e := s.db.Query(`SELECT id FROM jobs WHERE state=?`, finalizing)
-	if e == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var i string
-			rows.Scan(&i)
-			go s.finalize(i)
+	if e != nil {
+		return e
+	}
+	var finalizingJobs []string
+	for rows.Next() {
+		var jobID string
+		if e = rows.Scan(&jobID); e != nil {
+			rows.Close()
+			return e
 		}
+		finalizingJobs = append(finalizingJobs, jobID)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	for _, jobID := range finalizingJobs {
+		go s.finalize(jobID)
 	}
 	go s.admitPending()
 	s.schedule()
+	return nil
 }
 
 func (s *Server) runUploadGC() {
@@ -743,11 +764,10 @@ func (s *Server) expireUpload(jobID string, now time.Time) error {
 	return nil
 }
 
-func (s *Server) reconcileResumableUploads() {
+func (s *Server) reconcileResumableUploads() error {
 	rows, e := s.db.Query(`SELECT id,size FROM jobs WHERE state IN (?,?) ORDER BY created_at`, admitted, uploading)
 	if e != nil {
-		s.log.Error("find resumable uploads", "error", e)
-		return
+		return e
 	}
 	type resumableUpload struct {
 		id   string
@@ -758,15 +778,13 @@ func (s *Server) reconcileResumableUploads() {
 		var upload resumableUpload
 		if e = rows.Scan(&upload.id, &upload.size); e != nil {
 			rows.Close()
-			s.log.Error("read resumable upload", "error", e)
-			return
+			return e
 		}
 		uploads = append(uploads, upload)
 	}
 	if e = rows.Err(); e != nil {
 		rows.Close()
-		s.log.Error("read resumable uploads", "error", e)
-		return
+		return e
 	}
 	rows.Close()
 	for _, upload := range uploads {
@@ -776,46 +794,49 @@ func (s *Server) reconcileResumableUploads() {
 			if statErr != nil {
 				detail = fmt.Sprintf("spool input unavailable: %v", statErr)
 			}
-			s.failUpload(upload.id, errors.New(detail))
+			if e = s.failUpload(upload.id, errors.New(detail)); e != nil {
+				return e
+			}
 		}
 	}
+	return nil
 }
 
-func (s *Server) failUpload(jobID string, cause error) {
+func (s *Server) failUpload(jobID string, cause error) error {
 	mu := s.lock(jobID, -1)
 	mu.Lock()
 	defer mu.Unlock()
 	tx, e := s.db.Begin()
 	if e != nil {
-		s.log.Error("fail invalid resumable upload", "id", jobID, "error", e)
-		return
+		return e
 	}
 	defer tx.Rollback()
 	var reserved int64
 	if e = tx.QueryRow(`SELECT reserved FROM jobs WHERE id=? AND state IN (?,?)`, jobID, admitted, uploading).Scan(&reserved); e != nil {
-		return
+		return e
 	}
 	if _, e = tx.Exec(`UPDATE jobs SET state=?,reserved=0,error=?,expires_at=NULL,finished_at=? WHERE id=?`, failed, cause.Error(), time.Now().UTC().Format(time.RFC3339Nano), jobID); e != nil {
-		return
+		return e
 	}
 	if _, e = tx.Exec(`DELETE FROM chunks WHERE job_id=?`, jobID); e != nil {
-		return
+		return e
 	}
 	if _, e = tx.Exec(`DELETE FROM reservations WHERE job_id=?`, jobID); e != nil {
-		return
+		return e
 	}
 	if reserved > 0 {
 		if _, e = tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, reserved); e != nil {
-			return
+			return e
 		}
 	}
 	if e = tx.Commit(); e != nil {
-		return
+		return e
 	}
 	if e = os.RemoveAll(s.dir(jobID)); e != nil {
 		s.log.Error("remove invalid resumable upload spool", "id", jobID, "error", e)
 	}
 	s.log.Error("resumable upload failed integrity check", "id", jobID, "error", cause)
+	return nil
 }
 func (s *Server) schedule() {
 	s.scheduleMu.Lock()
@@ -1174,10 +1195,6 @@ func (s *Server) uploadInstructions(j Job) *APIUploadInstructions {
 
 func (s *Server) createJobResponse(j Job) APICreateJobResponse {
 	return APICreateJobResponse{ID: j.ID, State: j.State, ReservationBytes: j.Reserved, Upload: s.uploadInstructions(j), ExpiresAt: nullable(j.ExpiresAt)}
-}
-
-func resumableState(state string) bool {
-	return state == pending || state == admitted || state == uploading
 }
 
 func processingOrCompletedState(state string) bool {

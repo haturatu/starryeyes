@@ -68,6 +68,7 @@ func main() {
 		os.Exit(1)
 	}
 	json.NewDecoder(r.Body).Decode(&j)
+	r.Body.Close()
 	for j.State == "PENDING" {
 		time.Sleep(time.Second)
 		j = getJob(*base, j.ID)

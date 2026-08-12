@@ -154,7 +154,9 @@ func TestRecoverRejectsInvalidResumableSpool(t *testing.T) {
 	if _, err := service.db.Exec(`UPDATE capacity SET reserved=8 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	service.reconcileResumableUploads()
+	if err := service.reconcileResumableUploads(); err != nil {
+		t.Fatal(err)
+	}
 	job, err := service.job(jobID)
 	if err != nil {
 		t.Fatal(err)
