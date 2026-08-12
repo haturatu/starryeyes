@@ -10,12 +10,29 @@ The Compose service uses distinct host paths for local job metadata/input spool 
 
 ```sh
 sudo install -d -o 10001 -g 999 -m 0750 /var/lib/starryeyes
-rclone mount remote:starryeyes /mnt/remote-output/starryeyes --allow-other --vfs-cache-mode writes
 cp .env.example .env
 # Edit .env if your output path differs.
 docker compose config
 docker compose up --build
 ```
+
+### rclone FUSE output storage
+
+When `OUTPUT_DIR_HOST` is an rclone FUSE mount, Docker must be able to traverse the mount as the daemon user. Enable `user_allow_other` once in `/etc/fuse.conf`, then mount a generic remote and create the bind-mount source before starting Compose:
+
+```sh
+# /etc/fuse.conf: enable this once.
+sudo sh -c 'echo user_allow_other >> /etc/fuse.conf'
+
+# Replace remote:media-output with your own rclone remote and bucket/path.
+rclone mount remote:media-output /mnt/remote-output \
+  --allow-other \
+  --vfs-cache-mode writes
+
+mkdir -p /mnt/remote-output/starryeyes
+```
+
+Set `OUTPUT_DIR_HOST=/mnt/remote-output/starryeyes` in `.env`. Without `--allow-other`, the rclone-mount owner may access the path while the Docker daemon cannot, causing bind-mount creation or startup failures.
 
 The service runs without `privileged`, drops all Linux capabilities, uses a read-only container root filesystem, and mounts only `/tmp` as writable tmpfs. The worker applies Landlock, seccomp, and cgroup limits before executing FFmpeg. There is no unconfined fallback.
 
