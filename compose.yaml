@@ -1,19 +1,23 @@
 services:
   starryeyes:
     build: .
-    ports: ["8080:8080"]
+    ports: ["${HOST_PORT:?set HOST_PORT in .env}:8080"]
     environment:
       DATA_DIR: /var/lib/starryeyes
       OUTPUT_DIR: /mnt/output
-      SPOOL_CAPACITY_BYTES: "21474836480" # 20 GiB: local input-spool admission-control budget
-      CHUNK_SIZE_BYTES: "67108864"         # 64 MiB
-      MAX_ACTIVE_TRANSCODES: "2"
-      CGROUP_ROOT: ""
-      REQUIRE_CGROUP: "false"
-      REQUIRE_LANDLOCK: "true"
+      SPOOL_CAPACITY_BYTES: ${SPOOL_CAPACITY_BYTES:?set SPOOL_CAPACITY_BYTES in .env}
+      CHUNK_SIZE_BYTES: ${CHUNK_SIZE_BYTES:?set CHUNK_SIZE_BYTES in .env}
+      MAX_ACTIVE_TRANSCODES: ${MAX_ACTIVE_TRANSCODES:?set MAX_ACTIVE_TRANSCODES in .env}
+      MAX_WIDTH: ${MAX_WIDTH:?set MAX_WIDTH in .env}
+      MAX_HEIGHT: ${MAX_HEIGHT:?set MAX_HEIGHT in .env}
+      MAX_STREAMS: ${MAX_STREAMS:?set MAX_STREAMS in .env}
+      MAX_DURATION_SECONDS: ${MAX_DURATION_SECONDS:?set MAX_DURATION_SECONDS in .env}
+      CGROUP_ROOT: ${CGROUP_ROOT}
+      REQUIRE_CGROUP: ${REQUIRE_CGROUP:?set REQUIRE_CGROUP in .env}
+      REQUIRE_LANDLOCK: ${REQUIRE_LANDLOCK:?set REQUIRE_LANDLOCK in .env}
     volumes:
       - type: bind
-        source: /var/lib/starryeyes
+        source: ${DATA_DIR_HOST:?set DATA_DIR_HOST to the host data directory}
         target: /var/lib/starryeyes
       - type: bind
         source: ${OUTPUT_DIR_HOST:?set OUTPUT_DIR_HOST to the host output directory}

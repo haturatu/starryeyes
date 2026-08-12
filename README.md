@@ -6,7 +6,7 @@ The public API accepts a validated, high-level output specification. It never ac
 
 ## Quick start with Docker Compose
 
-The Compose service uses distinct host paths for local job metadata/input spool and completed output. Copy `.env.example` to `.env` and set `OUTPUT_DIR_HOST` to an existing path writable by UID `10001`. Docker Compose automatically reads `.env` next to `compose.yaml` for variable interpolation; `OUTPUT_DIR_HOST` is used only as the host-side bind-mount source and is not passed into the container.
+The Compose service uses distinct host paths for local job metadata/input spool and completed output. Copy `.env.example` to `.env` and set the host paths and service limits for your deployment. Docker Compose automatically reads `.env` next to `compose.yaml`; `DATA_DIR_HOST` and `OUTPUT_DIR_HOST` are used only as host-side bind-mount sources and are not passed into the container.
 
 ```sh
 sudo install -d -o 10001 -g 999 -m 0750 /var/lib/starryeyes
