@@ -53,7 +53,7 @@ go run ./cmd/demo-client --file sample.mp4
 
 ## Recursive directory upload
 
-Use [`scripts/upload-directory.sh`](scripts/upload-directory.sh) to submit every supported video file below a directory. It uploads files sequentially, requests the `web-1080p` preset by default, and prints the job ID for each submitted file.
+Use [`scripts/upload-directory.sh`](scripts/upload-directory.sh) to submit every supported video file below a directory. It uploads files sequentially, requests the `web-1080p` preset by default, and prints the job ID for each submitted file. When a server queues a job for local spool capacity, the script polls it until upload is admitted; set `ADMISSION_POLL_SECONDS` to change the default 10-second interval.
 
 ```sh
 scripts/upload-directory.sh http://localhost:8080 /path/to/videos

@@ -13,7 +13,8 @@ Arguments:
   directory   Directory to scan recursively
 
 Environment:
-  OUTPUT_PRESET  Output preset to request (default: web-1080p)
+  OUTPUT_PRESET             Output preset to request (default: web-1080p)
+  ADMISSION_POLL_SECONDS    Seconds between capacity-admission checks (default: 10)
 
 Requires: bash 4+, curl, jq, sha256sum, GNU stat, and GNU dd.
 EOF
@@ -58,7 +59,7 @@ print_response() {
 }
 
 upload_file() {
-	local file=$1 name size checksum payload response code job_id chunk_size
+	local file=$1 name size checksum payload response code job_id chunk_size state
 	local offset=0 chunk=0 length chunk_file chunk_checksum
 
 	name=$(basename -- "$file")
@@ -91,10 +92,14 @@ upload_file() {
 		printf 'create response has no job id for %q\n' "$file" >&2
 		return 1
 	}
-	chunk_size=$(jq --exit-status --raw-output '.upload.chunk_size | numbers | select(. > 0)' "$response") || {
-		printf 'create response has no chunk size for %q\n' "$file" >&2
+	state=$(jq --exit-status --raw-output '.state | strings | select(length > 0)' "$response") || {
+		printf 'create response has no state for %q\n' "$file" >&2
 		return 1
 	}
+	chunk_size=$(jq --exit-status --raw-output '.upload.chunk_size? | numbers | select(. > 0)' "$response" 2>/dev/null || true)
+	if [[ -z $chunk_size ]]; then
+		chunk_size=$(wait_for_upload "$job_id" "$file" "$state") || return 1
+	fi
 
 	printf 'uploading %q as job %s\n' "$file" "$job_id"
 	while (( offset < size )); do
@@ -139,6 +144,49 @@ upload_file() {
 	printf 'submitted %q (job %s)\n' "$file" "$job_id"
 }
 
+wait_for_upload() {
+	local job_id=$1 file=$2 state=$3 response code chunk_size error
+	while :; do
+		case $state in
+		ADMITTED|CREATED|UPLOADING)
+			chunk_size=$(jq --exit-status --raw-output '.upload.chunk_size | numbers | select(. > 0)' "$response" 2>/dev/null || true)
+			if [[ -n $chunk_size ]]; then
+				printf '%s\n' "$chunk_size"
+				return 0
+			fi
+			;;
+		PENDING)
+			printf 'waiting for spool capacity for %q (job %s)\n' "$file" "$job_id" >&2
+			;;
+		FAILED)
+			error=$(jq --raw-output '.error // "job failed before upload admission"' "$response" 2>/dev/null || true)
+			printf 'job %s failed before upload admission for %q: %s\n' "$job_id" "$file" "$error" >&2
+			return 1
+			;;
+		*)
+			printf 'job %s has unexpected pre-upload state %q for %q\n' "$job_id" "$state" "$file" >&2
+			return 1
+			;;
+		esac
+
+		sleep "$ADMISSION_POLL_SECONDS"
+		response="$work_dir/job-response.json"
+		if ! code=$(request GET "$server_url/v1/jobs/$job_id" '' "$response"); then
+			printf 'admission status request failed for %q\n' "$file" >&2
+			return 1
+		fi
+		if [[ $code != 200 ]]; then
+			printf 'admission status returned HTTP %s for %q' "$code" "$file" >&2
+			print_response "$response" >&2
+			return 1
+		fi
+		state=$(jq --exit-status --raw-output '.state | strings | select(length > 0)' "$response") || {
+			printf 'job status has no state for %q\n' "$file" >&2
+			return 1
+		}
+	done
+}
+
 [[ $# -eq 2 ]] || {
 	usage >&2
 	exit 2
@@ -147,9 +195,11 @@ upload_file() {
 server_url=${1%/}
 source_dir=$2
 OUTPUT_PRESET=${OUTPUT_PRESET:-web-1080p}
+ADMISSION_POLL_SECONDS=${ADMISSION_POLL_SECONDS:-10}
 
 [[ $server_url =~ ^https?://[^/]+($|/) ]] || die "server URL must start with http:// or https://"
 [[ -d $source_dir ]] || die "directory does not exist: $source_dir"
+[[ $ADMISSION_POLL_SECONDS =~ ^[1-9][0-9]*$ ]] || die "ADMISSION_POLL_SECONDS must be a positive integer"
 for command in curl dd find jq sha256sum stat; do
 	require_command "$command"
 done
