@@ -59,7 +59,9 @@ type Server struct {
 	sem         chan struct{}
 	scheduleMu  sync.Mutex
 	admissionMu sync.Mutex
-	locks       sync.Map
+	// A handler taking both locks must acquire the lifecycle lock first.
+	lifecycleLocks sync.Map
+	chunkLocks     sync.Map
 }
 type Job struct {
 	ID, State, Filename, Spec, InputHash, ActualHash string
@@ -266,19 +268,13 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		bad(w, 400, "invalid chunk")
 		return
 	}
+	lifecycle := s.lifecycleLock(jid)
+	lifecycle.RLock()
+	defer lifecycle.RUnlock()
+	chunk := s.chunkLock(jid, n)
+	chunk.Lock()
+	defer chunk.Unlock()
 	j, e := s.job(jid)
-	if e != nil {
-		bad(w, 404, "job not found")
-		return
-	}
-	if n >= j.Expected {
-		bad(w, 416, "chunk outside input")
-		return
-	}
-	mu := s.lock(jid, n)
-	mu.Lock()
-	defer mu.Unlock()
-	j, e = s.job(jid)
 	if e != nil {
 		bad(w, 404, "job not found")
 		return
@@ -383,7 +379,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	jid := r.PathValue("id")
-	mu := s.lock(jid, -1)
+	mu := s.lifecycleLock(jid)
 	mu.Lock()
 	defer mu.Unlock()
 	tx, e := s.db.Begin()
@@ -415,7 +411,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	out(w, http.StatusAccepted, APIJobStateResponse{ID: jid, State: finalizing})
 }
 func (s *Server) finalize(jid string) {
-	mu := s.lock(jid, -1)
+	mu := s.lifecycleLock(jid)
 	mu.Lock()
 	defer mu.Unlock()
 	part, in := filepath.Join(s.dir(jid), "input.part"), filepath.Join(s.dir(jid), "input")
@@ -721,7 +717,7 @@ func (s *Server) expireUploads(now time.Time) error {
 }
 
 func (s *Server) expireUpload(jobID string, now time.Time) error {
-	mu := s.lock(jobID, -1)
+	mu := s.lifecycleLock(jobID)
 	mu.Lock()
 	defer mu.Unlock()
 	tx, e := s.db.Begin()
@@ -803,7 +799,7 @@ func (s *Server) reconcileResumableUploads() error {
 }
 
 func (s *Server) failUpload(jobID string, cause error) error {
-	mu := s.lock(jobID, -1)
+	mu := s.lifecycleLock(jobID)
 	mu.Lock()
 	defer mu.Unlock()
 	tx, e := s.db.Begin()
@@ -964,9 +960,13 @@ func chunkBytes(size, chunkSize int64, n int) int64 {
 	}
 	return chunkSize
 }
-func (s *Server) lock(j string, n int) *sync.Mutex {
-	k := j + ":" + strconv.Itoa(n)
-	v, _ := s.locks.LoadOrStore(k, &sync.Mutex{})
+func (s *Server) lifecycleLock(jobID string) *sync.RWMutex {
+	v, _ := s.lifecycleLocks.LoadOrStore(jobID, &sync.RWMutex{})
+	return v.(*sync.RWMutex)
+}
+func (s *Server) chunkLock(jobID string, number int) *sync.Mutex {
+	k := jobID + ":" + strconv.Itoa(number)
+	v, _ := s.chunkLocks.LoadOrStore(k, &sync.Mutex{})
 	return v.(*sync.Mutex)
 }
 

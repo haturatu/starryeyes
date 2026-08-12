@@ -5,9 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -134,6 +137,103 @@ func TestExpireUploadReleasesCapacityAndSpool(t *testing.T) {
 	}
 }
 
+func TestChunkUploadPreventsConcurrentExpiry(t *testing.T) {
+	service, _ := newAPITestServer(t)
+	jobID := "78047daf0e72bd37dd856118a8eed24b"
+	spoolDir := service.dir(jobID)
+	if err := os.MkdirAll(spoolDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spoolDir, "input.part"), make([]byte, 4), 0640); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	past := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := service.db.Exec(`INSERT INTO jobs(id,state,filename,size,expected,chunk_size,spec,reserved,created_at,last_activity_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, jobID, admitted, "clip.mp4", 4, 1, 4, `{}`, 4, past, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.db.Exec(`INSERT INTO reservations(job_id,input_bytes,output_bytes,safety_bytes,total) VALUES(?,?,?,?,?)`, jobID, 4, 0, 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.db.Exec(`UPDATE capacity SET reserved=4 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	body := &blockedReader{
+		data:    []byte("test"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(body.release) }) }
+	defer release()
+	request := httptest.NewRequest(http.MethodPut, "/v1/jobs/"+jobID+"/chunks/0", body)
+	request.SetPathValue("id", jobID)
+	request.SetPathValue("chunk", "0")
+	request.ContentLength = 4
+	request.Header.Set("X-Chunk-SHA256", "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
+	recorder := httptest.NewRecorder()
+	putDone := make(chan struct{})
+	go func() {
+		service.chunk(recorder, request)
+		close(putDone)
+	}()
+	select {
+	case <-body.started:
+	case <-time.After(time.Second):
+		t.Fatal("chunk upload did not start reading its body")
+	}
+
+	expireStarted := make(chan struct{})
+	expireDone := make(chan error, 1)
+	go func() {
+		close(expireStarted)
+		expireDone <- service.expireUpload(jobID, now)
+	}()
+	<-expireStarted
+	select {
+	case err := <-expireDone:
+		t.Fatalf("expiry completed during an active chunk PUT: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case <-putDone:
+	case <-time.After(time.Second):
+		t.Fatal("chunk upload did not finish")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("chunk upload status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case err := <-expireDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expiry did not finish after the chunk PUT")
+	}
+
+	job, err := service.job(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != uploading || !job.ExpiresAt.Valid {
+		t.Fatalf("job after concurrent expiry = %#v, want resumable UPLOADING job", job)
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, job.ExpiresAt.String)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !expiresAt.After(now) {
+		t.Errorf("expires_at = %s, want a deadline after the GC cutoff %s", expiresAt, now)
+	}
+	if _, err = os.Stat(filepath.Join(spoolDir, "input.part")); err != nil {
+		t.Errorf("active upload spool was removed: %v", err)
+	}
+}
+
 func TestRecoverRejectsInvalidResumableSpool(t *testing.T) {
 	service, _ := newAPITestServer(t)
 	jobID := "68047daf0e72bd37dd856118a8eed24b"
@@ -168,6 +268,24 @@ func TestRecoverRejectsInvalidResumableSpool(t *testing.T) {
 	if err := service.db.QueryRow(`SELECT reserved FROM capacity WHERE id=1`).Scan(&capacity); err != nil || capacity != 0 {
 		t.Errorf("capacity after reconcile = %d, %v; want 0", capacity, err)
 	}
+}
+
+type blockedReader struct {
+	data    []byte
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockedReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
 }
 
 func createJobWithKey(t *testing.T, baseURL, key string, payload []byte, wantStatus int) APICreateJobResponse {
