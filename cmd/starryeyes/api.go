@@ -40,10 +40,10 @@ type APIUploadInstructions struct {
 }
 
 type APICreateJobResponse struct {
-	ID               string                `json:"id" doc:"Created job identifier."`
-	State            string                `json:"state" doc:"Initial job state."`
-	ReservationBytes int64                 `json:"reservation_bytes" doc:"Spool capacity reserved for this job."`
-	Upload           APIUploadInstructions `json:"upload" doc:"Instructions for uploading the input file."`
+	ID               string                 `json:"id" doc:"Created job identifier."`
+	State            string                 `json:"state" doc:"Initial job state. A new job starts as PENDING while it waits for local spool capacity."`
+	ReservationBytes int64                  `json:"reservation_bytes" doc:"Spool capacity currently reserved for this job; zero while pending."`
+	Upload           *APIUploadInstructions `json:"upload,omitempty" doc:"Instructions for uploading the input file, present only after admission."`
 }
 
 type APIChunkResponse struct {
@@ -58,17 +58,18 @@ type APIJobStateResponse struct {
 }
 
 type APIJobResponse struct {
-	ID               string  `json:"id" doc:"Job identifier."`
-	State            string  `json:"state" doc:"Current job state."`
-	Filename         string  `json:"filename" doc:"Original input filename."`
-	Size             int64   `json:"size" doc:"Input size in bytes."`
-	BytesReceived    int64   `json:"bytes_received" doc:"Number of verified upload bytes."`
-	ChunksReceived   int     `json:"chunks_received" doc:"Number of verified chunks."`
-	ChunksExpected   int     `json:"chunks_expected" doc:"Total number of chunks required."`
-	ReservationBytes int64   `json:"reservation_bytes" doc:"Spool capacity currently reserved for this job."`
-	InputSHA256      string  `json:"input_sha256" doc:"Verified SHA-256 of the completed input, when available."`
-	Error            *string `json:"error" doc:"Processing failure detail, when the job failed."`
-	OutputURL        *string `json:"output_url" doc:"URL of the completed output artifact, when available."`
+	ID               string                 `json:"id" doc:"Job identifier."`
+	State            string                 `json:"state" doc:"Current job state."`
+	Filename         string                 `json:"filename" doc:"Original input filename."`
+	Size             int64                  `json:"size" doc:"Input size in bytes."`
+	BytesReceived    int64                  `json:"bytes_received" doc:"Number of verified upload bytes."`
+	ChunksReceived   int                    `json:"chunks_received" doc:"Number of verified chunks."`
+	ChunksExpected   int                    `json:"chunks_expected" doc:"Total number of chunks required."`
+	ReservationBytes int64                  `json:"reservation_bytes" doc:"Spool capacity currently reserved for this job."`
+	Upload           *APIUploadInstructions `json:"upload,omitempty" doc:"Instructions for uploading the input file, present in ADMITTED and UPLOADING states."`
+	InputSHA256      string                 `json:"input_sha256" doc:"Verified SHA-256 of the completed input, when available."`
+	Error            *string                `json:"error" doc:"Processing failure detail, when the job failed."`
+	OutputURL        *string                `json:"output_url" doc:"URL of the completed output artifact, when available."`
 }
 
 func newRouter(s *Server) http.Handler {
@@ -100,11 +101,11 @@ func newRouter(s *Server) http.Handler {
 		OperationID: "createJob",
 		Method:      http.MethodPost,
 		Path:        "/v1/jobs",
-		Summary:     "Create a media conversion job",
+		Summary:     "Create a media conversion job and place it in the upload-admission queue",
 		RequestBody: jsonRequestBody(jsonSchema[Request](api), "Job input and requested output specification"),
 		Responses: mergeResponses(
-			responses(jsonSchema[APICreateJobResponse](api), http.StatusCreated, "Job created"),
-			errorResponses(api, http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusInternalServerError, http.StatusInsufficientStorage, http.StatusServiceUnavailable),
+			responses(jsonSchema[APICreateJobResponse](api), http.StatusCreated, "Job accepted in the upload-admission queue"),
+			errorResponses(api, http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusInternalServerError),
 		),
 	}, s.create)
 

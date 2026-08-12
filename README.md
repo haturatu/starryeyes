@@ -72,14 +72,15 @@ GET /v1/jobs/<job-id>/output
 
 ## Upload and job lifecycle
 
-1. `POST /v1/jobs` creates a job and reserves local input-spool capacity. Output estimates remain job metadata; output capacity is not yet admission-controlled.
-2. `PUT /v1/jobs/<job-id>/chunks/<number>` uploads a fixed-size chunk with `X-Chunk-SHA256`.
-3. Repeating a chunk with the same checksum is idempotent; a different checksum returns `409 Conflict`.
-4. `POST /v1/jobs/<job-id>/complete` atomically finalizes the upload.
-5. The server computes the whole-file hash, runs sandboxed `ffprobe`, validates media limits, and queues the job.
-6. The worker runs FFmpeg with a normalized, allowlisted JobSpec.
+1. `POST /v1/jobs` always creates a `PENDING` job. It does not return a capacity-exhaustion error.
+2. The server admits pending jobs in FIFO order when local input-spool capacity is available. `GET /v1/jobs/<job-id>` changes to `ADMITTED` and includes `upload` instructions only after the input file has been preallocated.
+3. `PUT /v1/jobs/<job-id>/chunks/<number>` uploads a fixed-size chunk with `X-Chunk-SHA256`.
+4. Repeating a chunk with the same checksum is idempotent; a different checksum returns `409 Conflict`.
+5. `POST /v1/jobs/<job-id>/complete` atomically finalizes the upload.
+6. The server computes the whole-file hash, runs sandboxed `ffprobe`, validates media limits, and queues the job.
+7. The worker runs FFmpeg with a normalized, allowlisted JobSpec.
 
-Job states include `CREATED`, `UPLOADING`, `FINALIZING`, `STAGED`, `PROBING`, `VALIDATED`, `QUEUED`, `TRANSCODING`, `COMPLETED`, and `FAILED`.
+Job states include `PENDING`, `ADMITTED`, `UPLOADING`, `FINALIZING`, `STAGED`, `PROBING`, `VALIDATED`, `QUEUED`, `TRANSCODING`, `COMPLETED`, and `FAILED`.
 
 ## Security model
 

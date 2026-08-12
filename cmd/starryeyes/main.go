@@ -28,7 +28,8 @@ import (
 )
 
 const (
-	created     = "CREATED"
+	pending     = "PENDING"
+	admitted    = "ADMITTED"
 	uploading   = "UPLOADING"
 	finalizing  = "FINALIZING"
 	staged      = "STAGED"
@@ -50,12 +51,13 @@ type Config struct {
 	MaxDuration                     float64
 }
 type Server struct {
-	db         *sql.DB
-	cfg        Config
-	log        *slog.Logger
-	sem        chan struct{}
-	scheduleMu sync.Mutex
-	locks      sync.Map
+	db          *sql.DB
+	cfg         Config
+	log         *slog.Logger
+	sem         chan struct{}
+	scheduleMu  sync.Mutex
+	admissionMu sync.Mutex
+	locks       sync.Map
 }
 type Input struct {
 	Filename string `json:"filename" minLength:"1" doc:"Basename of the uploaded media file. It must be 255 bytes or fewer and contain no path separators or control characters."`
@@ -183,7 +185,6 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := id()
-	outEstimate, safety, res := reservation(q.Input.Size, sp)
 	b, _ := json.Marshal(sp)
 	tx, e := s.db.Begin()
 	if e != nil {
@@ -191,21 +192,8 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	x, e := tx.Exec(`UPDATE capacity SET reserved=reserved+? WHERE id=1 AND reserved+?<=total`, res, res)
-	if e != nil {
-		bad(w, 500, e.Error())
-		return
-	}
-	n, _ := x.RowsAffected()
-	if n != 1 {
-		bad(w, 503, "spool capacity reserved")
-		return
-	}
 	expected := int((q.Input.Size + s.cfg.Chunk - 1) / s.cfg.Chunk)
-	_, e = tx.Exec(`INSERT INTO jobs(id,state,filename,size,expected,spec,input_hash,reserved,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, created, q.Input.Filename, q.Input.Size, expected, string(b), q.Input.SHA256, res, time.Now().UTC())
-	if e == nil {
-		_, e = tx.Exec(`INSERT INTO reservations(job_id,input_bytes,output_bytes,safety_bytes,total) VALUES(?,?,?,?,?)`, id, q.Input.Size, outEstimate, safety, res)
-	}
+	_, e = tx.Exec(`INSERT INTO jobs(id,state,filename,size,expected,spec,input_hash,reserved,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, pending, q.Input.Filename, q.Input.Size, expected, string(b), q.Input.SHA256, 0, time.Now().UTC())
 	if e == nil {
 		e = tx.Commit()
 	}
@@ -213,47 +201,11 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, e.Error())
 		return
 	}
-	dir := s.dir(id)
-	if e = os.MkdirAll(dir, 0750); e != nil {
-		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
-			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
-			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
-			return
-		}
-		bad(w, 500, e.Error())
-		return
-	}
-	f, e := os.OpenFile(filepath.Join(dir, "input.part"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0640)
-	if e != nil {
-		os.RemoveAll(dir)
-		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
-			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
-			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
-			return
-		}
-		bad(w, 500, e.Error())
-		return
-	}
-	defer f.Close()
-	if e = unix.Fallocate(int(f.Fd()), 0, 0, q.Input.Size); e != nil {
-		os.RemoveAll(dir)
-		if cleanupErr := s.cancelReservation(id, res); cleanupErr != nil {
-			s.log.Error("cancel reservation", "id", id, "error", cleanupErr)
-			bad(w, 500, "reservation cleanup: "+cleanupErr.Error())
-			return
-		}
-		bad(w, 507, "spool preallocation: "+e.Error())
-		return
-	}
+	go s.admitPending()
 	out(w, http.StatusCreated, APICreateJobResponse{
 		ID:               id,
-		State:            created,
-		ReservationBytes: res,
-		Upload: APIUploadInstructions{
-			Mode:           "chunked",
-			ChunkSize:      s.cfg.Chunk,
-			RequiredHeader: "X-Chunk-SHA256",
-		},
+		State:            pending,
+		ReservationBytes: 0,
 	})
 }
 func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
@@ -304,7 +256,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, e.Error())
 		return
 	}
-	if j.State != created && j.State != uploading {
+	if j.State != admitted && j.State != uploading {
 		bad(w, 409, "job is not accepting upload")
 		return
 	}
@@ -354,7 +306,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	var updated int64
 	if e == nil {
 		var x sql.Result
-		x, e = tx.Exec(`UPDATE jobs SET state=?,received=received+?,chunks=chunks+1 WHERE id=? AND state IN (?,?)`, uploading, want, jid, created, uploading)
+		x, e = tx.Exec(`UPDATE jobs SET state=?,received=received+?,chunks=chunks+1 WHERE id=? AND state IN (?,?)`, uploading, want, jid, admitted, uploading)
 		if e == nil {
 			updated, _ = x.RowsAffected()
 		}
@@ -382,7 +334,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, e.Error())
 		return
 	}
-	x, e := tx.Exec(`UPDATE jobs SET state=? WHERE id=? AND state IN (?,?) AND received=size AND chunks=expected`, finalizing, jid, created, uploading)
+	x, e := tx.Exec(`UPDATE jobs SET state=? WHERE id=? AND state IN (?,?) AND received=size AND chunks=expected`, finalizing, jid, admitted, uploading)
 	if e == nil {
 		e = tx.Commit()
 	} else {
@@ -490,6 +442,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		ChunksReceived:   j.Chunks,
 		ChunksExpected:   j.Expected,
 		ReservationBytes: j.Reserved,
+		Upload:           s.uploadInstructions(j),
 		InputSHA256:      j.ActualHash,
 		Error:            nullable(j.Error),
 		OutputURL:        artifactURL(j),
@@ -511,12 +464,120 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 	}))
 	http.ServeFile(w, r, filepath.Join(s.outputDir(j.ID), name))
 }
+
+// admitPending reserves spool capacity and creates the input file for queued
+// jobs in FIFO order. A job remains PENDING until its preallocated input file
+// exists, so clients never receive upload instructions prematurely.
+func (s *Server) admitPending() {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+
+	for {
+		j, e := s.oldestPendingJob()
+		if e == sql.ErrNoRows {
+			return
+		}
+		if e != nil {
+			s.log.Error("find pending job", "error", e)
+			return
+		}
+		if j.Reserved == 0 {
+			if e := s.reservePending(j); e != nil {
+				if errors.Is(e, errCapacityUnavailable) {
+					return
+				}
+				s.fail(j.ID, e)
+				continue
+			}
+			j.Reserved = j.Size
+		}
+		if e := s.prepareInput(j); e != nil {
+			s.fail(j.ID, fmt.Errorf("spool preallocation: %w", e))
+			continue
+		}
+		result, e := s.db.Exec(`UPDATE jobs SET state=? WHERE id=? AND state=? AND reserved=?`, admitted, j.ID, pending, j.Reserved)
+		if e != nil {
+			s.fail(j.ID, e)
+			continue
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			continue
+		}
+		s.log.Info("job admitted for upload", "id", j.ID, "reserved_bytes", j.Reserved)
+	}
+}
+
+var errCapacityUnavailable = errors.New("spool capacity temporarily unavailable")
+
+func (s *Server) oldestPendingJob() (Job, error) {
+	var j Job
+	e := s.db.QueryRow(`SELECT id,size,spec,reserved FROM jobs WHERE state=? ORDER BY created_at,id LIMIT 1`, pending).Scan(&j.ID, &j.Size, &j.Spec, &j.Reserved)
+	return j, e
+}
+
+func (s *Server) reservePending(j Job) error {
+	var o Output
+	if e := json.Unmarshal([]byte(j.Spec), &o); e != nil {
+		return fmt.Errorf("decode output specification: %w", e)
+	}
+	outEstimate, safety, reserved := reservation(j.Size, o)
+	tx, e := s.db.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	result, e := tx.Exec(`UPDATE capacity SET reserved=reserved+? WHERE id=1 AND reserved+?<=total`, reserved, reserved)
+	if e != nil {
+		return e
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errCapacityUnavailable
+	}
+	result, e = tx.Exec(`UPDATE jobs SET reserved=? WHERE id=? AND state=? AND reserved=0`, reserved, j.ID, pending)
+	if e != nil {
+		return e
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("pending job changed during admission")
+	}
+	if _, e = tx.Exec(`INSERT INTO reservations(job_id,input_bytes,output_bytes,safety_bytes,total) VALUES(?,?,?,?,?)`, j.ID, j.Size, outEstimate, safety, reserved); e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
+func (s *Server) prepareInput(j Job) error {
+	dir := s.dir(j.ID)
+	if e := os.MkdirAll(dir, 0750); e != nil {
+		return e
+	}
+	f, e := os.OpenFile(filepath.Join(dir, "input.part"), os.O_CREATE|os.O_RDWR, 0640)
+	if e != nil {
+		return e
+	}
+	defer f.Close()
+	info, e := f.Stat()
+	if e != nil {
+		return e
+	}
+	if info.Size() != j.Size {
+		if e = f.Truncate(0); e != nil {
+			return e
+		}
+		if e = unix.Fallocate(int(f.Fd()), 0, 0, j.Size); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
 func (s *Server) job(id string) (Job, error) {
 	var j Job
 	e := s.db.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.State, &j.Filename, &j.Size, &j.Received, &j.Chunks, &j.Expected, &j.Spec, &j.InputHash, &j.ActualHash, &j.Reserved, &j.Error, &j.Artifact)
 	return j, e
 }
 func (s *Server) recover() {
+	s.db.Exec(`UPDATE jobs SET state=? WHERE state=?`, admitted, "CREATED")
 	s.db.Exec(`UPDATE jobs SET state=? WHERE state IN (?,?)`, queued, starting, transcoding)
 	rows, e := s.db.Query(`SELECT id FROM jobs WHERE state=?`, finalizing)
 	if e == nil {
@@ -527,6 +588,7 @@ func (s *Server) recover() {
 			go s.finalize(i)
 		}
 	}
+	go s.admitPending()
 	s.schedule()
 }
 func (s *Server) schedule() {
@@ -604,25 +666,9 @@ func (s *Server) release(j Job) {
 		if n == 1 {
 			s.db.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, j.Reserved)
 			s.db.Exec(`DELETE FROM reservations WHERE job_id=?`, j.ID)
+			go s.admitPending()
 		}
 	}
-}
-func (s *Server) cancelReservation(id string, res int64) error {
-	tx, e := s.db.Begin()
-	if e != nil {
-		return e
-	}
-	defer tx.Rollback()
-	if _, e = tx.Exec(`DELETE FROM reservations WHERE job_id=?`, id); e != nil {
-		return e
-	}
-	if _, e = tx.Exec(`DELETE FROM jobs WHERE id=?`, id); e != nil {
-		return e
-	}
-	if _, e = tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, res); e != nil {
-		return e
-	}
-	return tx.Commit()
 }
 func (s *Server) probeCmd(in string) *exec.Cmd {
 	return s.sandbox(nil, in, "", []string{"/usr/bin/ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", in})
@@ -884,6 +930,12 @@ func artifactURL(j Job) *string {
 		return &url
 	}
 	return nil
+}
+func (s *Server) uploadInstructions(j Job) *APIUploadInstructions {
+	if j.State != admitted && j.State != uploading {
+		return nil
+	}
+	return &APIUploadInstructions{Mode: "chunked", ChunkSize: s.cfg.Chunk, RequiredHeader: "X-Chunk-SHA256"}
 }
 func truncate(x string, n int) string {
 	if n <= 0 {
