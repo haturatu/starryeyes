@@ -1,0 +1,8 @@
+# Opt-in Compose override for NVIDIA NVENC. Docker Engine needs the NVIDIA
+# Container Toolkit installed on the host for `gpus: all` to work.
+services:
+  starryeyes:
+    gpus: all
+    environment:
+      # Required by the NVIDIA Container Toolkit for FFmpeg's Video Codec SDK.
+      NVIDIA_DRIVER_CAPABILITIES: video,utility
