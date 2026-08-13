@@ -1,0 +1,9 @@
+# Opt-in Compose override for Intel and AMD VA-API encoding. The device is not
+# exposed by the base service so CPU-only deployments retain their strict
+# device boundary.
+services:
+  starryeyes:
+    devices:
+      - ${VAAPI_DEVICE:-/dev/dri/renderD128}:${VAAPI_DEVICE:-/dev/dri/renderD128}
+    group_add:
+      - ${RENDER_GID:?set RENDER_GID to the host render group's numeric GID}

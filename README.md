@@ -4,6 +4,27 @@
 
 The public API accepts a validated, high-level output specification. It never accepts arbitrary FFmpeg arguments or shell commands.
 
+## Video encoder selection
+
+Select the video codec independently from the server-side encoder mode. `auto` is the default and is normally the best choice: it tries an exposed NVIDIA device with NVENC first, then an exposed VA-API render node (Intel or AMD), and finally retries with the software encoder if hardware startup or transcoding fails. The stored job specification remains the portable high-level request; it never exposes FFmpeg encoder names.
+
+```json
+{
+  "video": {
+    "codec": "hevc",
+    "encoder": "auto"
+  }
+}
+```
+
+Use `software`, `vaapi`, or `nvenc` to require one mode. Explicit hardware modes do not fall back, so a missing device or unsupported FFmpeg build fails the job visibly. The `/v1/capabilities` response and OpenAPI schema list all accepted modes. For example:
+
+```json
+{"video":{"codec":"hevc","encoder":"software"}}
+{"video":{"codec":"hevc","encoder":"vaapi"}}
+{"video":{"codec":"hevc","encoder":"nvenc"}}
+```
+
 ## API documentation
 
 The live server publishes OpenAPI at `/openapi.json` and interactive documentation at `/docs`. The same API definition is generated during CI and published at [haturatu.github.io/starryeyes](https://haturatu.github.io/starryeyes/) after changes reach `main`.
@@ -20,6 +41,23 @@ cp .env.example .env
 # Edit .env if your output path differs.
 docker compose config
 docker compose up --build
+```
+
+### Hardware encoding with Docker
+
+The base Compose service deliberately does not expose GPU devices. For an Intel or AMD VA-API render node, set the host `render` group ID and start with the opt-in override; it passes the selected `/dev/dri/renderD*` node into the container and keeps the container unprivileged.
+
+```sh
+RENDER_GID="$(getent group render | cut -d: -f3)" \
+  docker compose -f compose.yaml -f compose.vaapi.yaml up --build
+```
+
+Set the same `RENDER_GID` in `.env` for repeated runs. Use `VAAPI_DEVICE=/dev/dri/renderD129` when the desired host render node differs from the default. Starryeyes grants the selected node only to the sandboxed FFmpeg worker, not to the HTTP process generally.
+
+For NVIDIA, install the NVIDIA Container Toolkit on the host and use the NVIDIA override instead; Docker supplies the required `/dev/nvidia*` nodes to FFmpeg.
+
+```sh
+docker compose -f compose.yaml -f compose.nvidia.yaml up --build
 ```
 
 ### rclone FUSE output storage
@@ -129,6 +167,7 @@ This schema intentionally does not migrate databases created before resumable up
 - Seccomp denies sockets, mount and namespace changes, ptrace, BPF, and other high-risk operations. FFmpeg and ffprobe additionally use `-protocol_whitelist file,pipe`.
 - cgroup v2 limits memory, swap, PIDs, CPU weight, and CPU quota per job. Production systemd deployment uses delegated cgroups via [deploy/starryeyes.service](deploy/starryeyes.service).
 - The Docker container has no added capabilities, no privileged mode, `no-new-privileges`, a read-only root filesystem, and a dedicated bind-mounted data directory.
+- GPU device access is opt-in through the Compose overrides. The sandbox allowlists only the VA-API render node or NVIDIA device nodes selected for the job.
 
 Landlock controls access to the existing filesystem rather than creating a replacement root filesystem. Docker, seccomp, DAC, and host MAC policy remain part of the defense-in-depth boundary.
 
@@ -143,6 +182,7 @@ CHUNK_SIZE_BYTES=67108864
 MAX_ACTIVE_TRANSCODES=2
 SPOOL_CAPACITY_BYTES=21474836480
 UPLOAD_RETENTION=168h
+VAAPI_DEVICE=/dev/dri/renderD128 # VA-API render node; map it with compose.vaapi.yaml
 REQUIRE_LANDLOCK=true
 REQUIRE_CGROUP=true       # production; Compose sets false because it has no delegation
 CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
@@ -157,5 +197,6 @@ bash -n scripts/upload-directory.sh
 go run ./cmd/gen-docs public
 cp .env.example .env
 docker compose config
+RENDER_GID="$(getent group render | cut -d: -f3)" docker compose -f compose.yaml -f compose.vaapi.yaml config
 docker compose up --build
 ```
