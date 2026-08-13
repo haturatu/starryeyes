@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"errors"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -30,6 +33,47 @@ func TestNormalizeVideoEncoder(t *testing.T) {
 	request.Output.Video.Encoder = "qsv"
 	if _, err = normalize(request, config); err == nil {
 		t.Error("normalize accepted an unsupported video encoder")
+	}
+
+	request.Output.Video.Codec = "vp9"
+	request.Output.Video.Encoder = "nvenc"
+	request.Output.Container = "webm"
+	request.Output.Audio.Codec = "opus"
+	if _, err = normalize(request, config); !errors.Is(err, errUnsupportedEncoderCodec) {
+		t.Errorf("normalize vp9/nvenc error = %v, want unsupported encoder/codec error", err)
+	}
+}
+
+func TestCreateRejectsVP9NVENC(t *testing.T) {
+	_, server := newAPITestServer(t)
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewBufferString(`{"input":{"filename":"clip.webm","size":1048576},"output":{"container":"webm","video":{"codec":"vp9","encoder":"nvenc"},"audio":{"codec":"opus"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "vp9-nvenc-is-not-supported")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Errorf("vp9/nvenc create status = %d, want %d", response.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestNVENCCodecSupport(t *testing.T) {
+	for codec, want := range map[string]string{"h264": "h264_nvenc", "hevc": "hevc_nvenc", "av1": "av1_nvenc"} {
+		got, ok := nvencEncoder(codec)
+		if !ok || got != want {
+			t.Errorf("nvencEncoder(%q) = %q, %t; want %q, true", codec, got, ok, want)
+		}
+	}
+	if got, ok := nvencEncoder("vp9"); ok || got != "" {
+		t.Errorf("nvencEncoder(vp9) = %q, %t; want empty, false", got, ok)
+	}
+	if _, err := (&Server{}).videoEncoders(Video{Codec: "vp9", Encoder: "nvenc"}); !errors.Is(err, errUnsupportedEncoderCodec) {
+		t.Errorf("vp9/nvenc selection error = %v, want unsupported encoder/codec error", err)
 	}
 }
 

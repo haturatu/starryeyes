@@ -3,3 +3,6 @@
 services:
   starryeyes:
     gpus: all
+    environment:
+      # Required by the NVIDIA Container Toolkit for FFmpeg's Video Codec SDK.
+      NVIDIA_DRIVER_CAPABILITIES: video,utility

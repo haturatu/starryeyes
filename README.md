@@ -54,7 +54,7 @@ RENDER_GID="$(getent group render | cut -d: -f3)" \
 
 Set the same `RENDER_GID` in `.env` for repeated runs. Use `VAAPI_DEVICE=/dev/dri/renderD129` when the desired host render node differs from the default. Starryeyes grants the selected node only to the sandboxed FFmpeg worker, not to the HTTP process generally.
 
-For NVIDIA, install the NVIDIA Container Toolkit on the host and use the NVIDIA override instead; Docker supplies the required `/dev/nvidia*` nodes to FFmpeg.
+For NVIDIA, install the NVIDIA Container Toolkit on the host and use the NVIDIA override instead; Docker supplies the required `/dev/nvidia*` nodes to FFmpeg. The override explicitly enables the Toolkit's `video,utility` driver capabilities, which are required by NVENC; it does not enable CUDA compute.
 
 ```sh
 docker compose -f compose.yaml -f compose.nvidia.yaml up --build

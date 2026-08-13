@@ -171,7 +171,11 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	sp, e := normalize(q, s.cfg)
 	if e != nil {
-		bad(w, 422, e.Error())
+		status := http.StatusUnprocessableEntity
+		if errors.Is(e, errUnsupportedEncoderCodec) {
+			status = http.StatusBadRequest
+		}
+		bad(w, status, e.Error())
 		return
 	}
 	q.Input.SHA256 = strings.ToLower(q.Input.SHA256)
@@ -1024,6 +1028,8 @@ type videoEncoder struct {
 	hardware   bool
 }
 
+var errUnsupportedEncoderCodec = errors.New("unsupported video encoder for codec")
+
 func (s *Server) videoEncoders(video Video) ([]videoEncoder, error) {
 	software := videoEncoder{mode: "software", name: softwareEncoder(video.Codec)}
 	switch video.Encoder {
@@ -1036,15 +1042,21 @@ func (s *Server) videoEncoders(video Video) ([]videoEncoder, error) {
 		}
 		return []videoEncoder{{mode: "vaapi", name: video.Codec + "_vaapi", devices: []string{device}, hardware: true}}, nil
 	case "nvenc":
+		name, ok := nvencEncoder(video.Codec)
+		if !ok {
+			return nil, fmt.Errorf("%w: NVENC does not support %s", errUnsupportedEncoderCodec, video.Codec)
+		}
 		devices := nvidiaDevices()
 		if len(devices) == 0 {
 			return nil, errors.New("NVENC encoder requested but NVIDIA device nodes are unavailable")
 		}
-		return []videoEncoder{{mode: "nvenc", name: video.Codec + "_nvenc", devices: devices, hardware: true}}, nil
+		return []videoEncoder{{mode: "nvenc", name: name, devices: devices, hardware: true}}, nil
 	case "auto":
 		candidates := make([]videoEncoder, 0, 3)
-		if devices := nvidiaDevices(); len(devices) > 0 {
-			candidates = append(candidates, videoEncoder{mode: "nvenc", name: video.Codec + "_nvenc", devices: devices, hardware: true})
+		if name, ok := nvencEncoder(video.Codec); ok {
+			if devices := nvidiaDevices(); len(devices) > 0 {
+				candidates = append(candidates, videoEncoder{mode: "nvenc", name: name, devices: devices, hardware: true})
+			}
 		}
 		if device, ok := s.vaapiDevice(); ok {
 			candidates = append(candidates, videoEncoder{mode: "vaapi", name: video.Codec + "_vaapi", devices: []string{device}, hardware: true})
@@ -1052,6 +1064,15 @@ func (s *Server) videoEncoders(video Video) ([]videoEncoder, error) {
 		return append(candidates, software), nil
 	default:
 		return nil, errors.New("unsupported video encoder")
+	}
+}
+
+func nvencEncoder(codec string) (string, bool) {
+	switch codec {
+	case "h264", "hevc", "av1":
+		return codec + "_nvenc", true
+	default:
+		return "", false
 	}
 }
 
@@ -1160,6 +1181,11 @@ func normalize(r Request, c Config) (Output, error) {
 	}
 	if o.Video.Encoder != "auto" && o.Video.Encoder != "software" && o.Video.Encoder != "vaapi" && o.Video.Encoder != "nvenc" {
 		return o, errors.New("unsupported video encoder")
+	}
+	if o.Video.Encoder == "nvenc" {
+		if _, ok := nvencEncoder(o.Video.Codec); !ok {
+			return o, fmt.Errorf("%w: NVENC does not support %s", errUnsupportedEncoderCodec, o.Video.Codec)
+		}
 	}
 	if o.Audio.BitrateKbps < 16 || o.Audio.BitrateKbps > 512 {
 		return o, errors.New("audio bitrate out of range")
