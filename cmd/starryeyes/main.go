@@ -40,6 +40,7 @@ const (
 	transcoding = "TRANSCODING"
 	completed   = "COMPLETED"
 	failed      = "FAILED"
+	expired     = "EXPIRED"
 )
 
 type Config struct {
@@ -49,6 +50,7 @@ type Config struct {
 	RequireCgroup, RequireLandlock  bool
 	MaxWidth, MaxHeight, MaxStreams int
 	MaxDuration                     float64
+	UploadRetention                 time.Duration
 }
 type Server struct {
 	db          *sql.DB
@@ -57,13 +59,15 @@ type Server struct {
 	sem         chan struct{}
 	scheduleMu  sync.Mutex
 	admissionMu sync.Mutex
-	locks       sync.Map
+	// A handler taking both locks must acquire the lifecycle lock first.
+	lifecycleLocks sync.Map
+	chunkLocks     sync.Map
 }
 type Job struct {
 	ID, State, Filename, Spec, InputHash, ActualHash string
-	Size, Received, Reserved                         int64
+	Size, Received, Reserved, ChunkSize              int64
 	Chunks, Expected                                 int
-	Error, Artifact                                  sql.NullString
+	Error, Artifact, ExpiresAt                       sql.NullString
 	CreatedAt                                        string
 }
 type Probe struct {
@@ -122,14 +126,17 @@ func main() {
 	if e = s.schema(); e != nil {
 		stdlog.Fatal(e)
 	}
-	go s.recover()
+	if e = s.recover(); e != nil {
+		stdlog.Fatal(e)
+	}
+	go s.runUploadGC()
 	h := http.MaxBytesHandler(newRouter(s), c.Chunk+8192)
 	srv := &http.Server{Addr: c.Listen, Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second}
 	s.log.Info("listening", "address", c.Listen)
 	stdlog.Fatal(srv.ListenAndServe())
 }
 func (s *Server) schema() error {
-	_, e := s.db.Exec(`CREATE TABLE IF NOT EXISTS capacity(id INTEGER PRIMARY KEY CHECK(id=1), total INTEGER NOT NULL,reserved INTEGER NOT NULL DEFAULT 0); INSERT OR IGNORE INTO capacity(id,total,reserved) VALUES(1,0,0); UPDATE capacity SET total=? WHERE id=1 AND reserved=0; CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,state TEXT NOT NULL,filename TEXT NOT NULL,size INTEGER NOT NULL,received INTEGER NOT NULL DEFAULT 0,chunks INTEGER NOT NULL DEFAULT 0,expected INTEGER NOT NULL,spec TEXT NOT NULL,input_hash TEXT,actual_hash TEXT,reserved INTEGER NOT NULL,error TEXT,artifact TEXT,probe_json TEXT,created_at TEXT NOT NULL,started_at TEXT,finished_at TEXT); CREATE TABLE IF NOT EXISTS reservations(job_id TEXT PRIMARY KEY,input_bytes INTEGER NOT NULL,output_bytes INTEGER NOT NULL,safety_bytes INTEGER NOT NULL,total INTEGER NOT NULL,FOREIGN KEY(job_id) REFERENCES jobs(id)); CREATE TABLE IF NOT EXISTS chunks(job_id TEXT NOT NULL,number INTEGER NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job_id,number),FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);`, s.cfg.Capacity)
+	_, e := s.db.Exec(`CREATE TABLE IF NOT EXISTS capacity(id INTEGER PRIMARY KEY CHECK(id=1), total INTEGER NOT NULL,reserved INTEGER NOT NULL DEFAULT 0); INSERT OR IGNORE INTO capacity(id,total,reserved) VALUES(1,0,0); UPDATE capacity SET total=? WHERE id=1 AND reserved=0; CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,client_request_id TEXT UNIQUE,request_hash TEXT,state TEXT NOT NULL,filename TEXT NOT NULL,size INTEGER NOT NULL,received INTEGER NOT NULL DEFAULT 0,chunks INTEGER NOT NULL DEFAULT 0,expected INTEGER NOT NULL,chunk_size INTEGER NOT NULL,spec TEXT NOT NULL,input_hash TEXT,actual_hash TEXT,reserved INTEGER NOT NULL,error TEXT,artifact TEXT,probe_json TEXT,created_at TEXT NOT NULL,last_activity_at TEXT,expires_at TEXT,started_at TEXT,finished_at TEXT); CREATE TABLE IF NOT EXISTS reservations(job_id TEXT PRIMARY KEY,input_bytes INTEGER NOT NULL,output_bytes INTEGER NOT NULL,safety_bytes INTEGER NOT NULL,total INTEGER NOT NULL,FOREIGN KEY(job_id) REFERENCES jobs(id)); CREATE TABLE IF NOT EXISTS chunks(job_id TEXT NOT NULL,number INTEGER NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job_id,number),FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state); CREATE INDEX IF NOT EXISTS jobs_upload_expiry ON jobs(expires_at) WHERE state IN ('PENDING','ADMITTED','UPLOADING');`, s.cfg.Capacity)
 	return e
 }
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -150,6 +157,11 @@ func (s *Server) cap(w http.ResponseWriter, r *http.Request) {
 	})
 }
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Idempotency-Key")
+	if !validIdempotencyKey(key) {
+		bad(w, http.StatusBadRequest, "valid Idempotency-Key header required")
+		return
+	}
 	var q Request
 	if e := json.NewDecoder(r.Body).Decode(&q); e != nil {
 		bad(w, 400, "invalid JSON")
@@ -160,16 +172,48 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		bad(w, 422, e.Error())
 		return
 	}
-	id := id()
-	b, _ := json.Marshal(sp)
+	q.Input.SHA256 = strings.ToLower(q.Input.SHA256)
+	spec, _ := json.Marshal(sp)
+	identity, _ := json.Marshal(struct {
+		Input  Input  `json:"input"`
+		Output Output `json:"output"`
+	}{Input: q.Input, Output: sp})
+	requestHash := sha256.Sum256(identity)
+	now := time.Now().UTC()
+	expiresAt := uploadExpiry(now, s.cfg.UploadRetention)
 	tx, e := s.db.Begin()
 	if e != nil {
 		bad(w, 500, e.Error())
 		return
 	}
 	defer tx.Rollback()
+	var existing Job
+	var existingHash string
+	e = tx.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,chunk_size,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact,created_at,expires_at,COALESCE(request_hash,'') FROM jobs WHERE client_request_id=?`, key).Scan(&existing.ID, &existing.State, &existing.Filename, &existing.Size, &existing.Received, &existing.Chunks, &existing.Expected, &existing.ChunkSize, &existing.Spec, &existing.InputHash, &existing.ActualHash, &existing.Reserved, &existing.Error, &existing.Artifact, &existing.CreatedAt, &existing.ExpiresAt, &existingHash)
+	if e == nil {
+		if existingHash != hex.EncodeToString(requestHash[:]) {
+			bad(w, http.StatusConflict, "Idempotency-Key already used with a different request")
+			return
+		}
+		// An idempotent replay discovers the existing workflow but is not
+		// upload activity, so it deliberately does not extend retention.
+		if e == nil {
+			e = tx.Commit()
+		}
+		if e != nil {
+			bad(w, http.StatusInternalServerError, e.Error())
+			return
+		}
+		out(w, http.StatusCreated, s.createJobResponse(existing))
+		return
+	}
+	if e != sql.ErrNoRows {
+		bad(w, http.StatusInternalServerError, e.Error())
+		return
+	}
+	jobID := id()
 	expected := int((q.Input.Size + s.cfg.Chunk - 1) / s.cfg.Chunk)
-	_, e = tx.Exec(`INSERT INTO jobs(id,state,filename,size,expected,spec,input_hash,reserved,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, pending, q.Input.Filename, q.Input.Size, expected, string(b), q.Input.SHA256, 0, time.Now().UTC())
+	_, e = tx.Exec(`INSERT INTO jobs(id,client_request_id,request_hash,state,filename,size,expected,chunk_size,spec,input_hash,reserved,created_at,last_activity_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, jobID, key, hex.EncodeToString(requestHash[:]), pending, q.Input.Filename, q.Input.Size, expected, s.cfg.Chunk, string(spec), q.Input.SHA256, 0, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), expiresAt)
 	if e == nil {
 		e = tx.Commit()
 	}
@@ -179,10 +223,43 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	go s.admitPending()
 	out(w, http.StatusCreated, APICreateJobResponse{
-		ID:               id,
+		ID:               jobID,
 		State:            pending,
 		ReservationBytes: 0,
+		ExpiresAt:        &expiresAt,
 	})
+}
+
+func (s *Server) listChunks(w http.ResponseWriter, r *http.Request) {
+	j, e := s.job(r.PathValue("id"))
+	if e == sql.ErrNoRows {
+		bad(w, http.StatusNotFound, "job not found")
+		return
+	}
+	if e != nil {
+		bad(w, http.StatusInternalServerError, e.Error())
+		return
+	}
+	rows, e := s.db.Query(`SELECT number,bytes,sha256 FROM chunks WHERE job_id=? AND state='VERIFIED' ORDER BY number`, j.ID)
+	if e != nil {
+		bad(w, http.StatusInternalServerError, e.Error())
+		return
+	}
+	defer rows.Close()
+	chunks := make([]APIVerifiedChunk, 0, j.Chunks)
+	for rows.Next() {
+		var chunk APIVerifiedChunk
+		if e = rows.Scan(&chunk.Number, &chunk.Size, &chunk.SHA256); e != nil {
+			bad(w, http.StatusInternalServerError, e.Error())
+			return
+		}
+		chunks = append(chunks, chunk)
+	}
+	if e = rows.Err(); e != nil {
+		bad(w, http.StatusInternalServerError, e.Error())
+		return
+	}
+	out(w, http.StatusOK, APIChunksResponse{ChunkSize: j.ChunkSize, Expected: j.Expected, Chunks: chunks})
 }
 func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	jid := r.PathValue("id")
@@ -191,6 +268,12 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		bad(w, 400, "invalid chunk")
 		return
 	}
+	lifecycle := s.lifecycleLock(jid)
+	lifecycle.RLock()
+	defer lifecycle.RUnlock()
+	chunk := s.chunkLock(jid, n)
+	chunk.Lock()
+	defer chunk.Unlock()
 	j, e := s.job(jid)
 	if e != nil {
 		bad(w, 404, "job not found")
@@ -200,19 +283,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		bad(w, 416, "chunk outside input")
 		return
 	}
-	mu := s.lock(jid, n)
-	mu.Lock()
-	defer mu.Unlock()
-	j, e = s.job(jid)
-	if e != nil {
-		bad(w, 404, "job not found")
-		return
-	}
-	if n >= j.Expected {
-		bad(w, 416, "chunk outside input")
-		return
-	}
-	want := s.chunkBytes(j.Size, n)
+	want := chunkBytes(j.Size, j.ChunkSize, n)
 	sum := strings.ToLower(r.Header.Get("X-Chunk-SHA256"))
 	if r.ContentLength != want || len(sum) != 64 {
 		bad(w, 400, "exact Content-Length and X-Chunk-SHA256 required")
@@ -222,6 +293,11 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	e = s.db.QueryRow(`SELECT sha256 FROM chunks WHERE job_id=? AND number=? AND state='VERIFIED'`, jid, n).Scan(&have)
 	if e == nil {
 		if have == sum {
+			now := time.Now().UTC()
+			if _, updateErr := s.db.Exec(`UPDATE jobs SET last_activity_at=?,expires_at=? WHERE id=? AND state IN (?,?)`, now.Format(time.RFC3339Nano), uploadExpiry(now, s.cfg.UploadRetention), jid, admitted, uploading); updateErr != nil {
+				bad(w, http.StatusInternalServerError, updateErr.Error())
+				return
+			}
 			out(w, http.StatusOK, APIChunkResponse{Chunk: n, Status: "already_present"})
 			return
 		}
@@ -245,7 +321,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	h := sha256.New()
 	buf := make([]byte, 1<<20)
 	var got int64
-	off := int64(n) * s.cfg.Chunk
+	off := int64(n) * j.ChunkSize
 	for {
 		z, er := r.Body.Read(buf)
 		if z > 0 {
@@ -282,7 +358,8 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	var updated int64
 	if e == nil {
 		var x sql.Result
-		x, e = tx.Exec(`UPDATE jobs SET state=?,received=received+?,chunks=chunks+1 WHERE id=? AND state IN (?,?)`, uploading, want, jid, admitted, uploading)
+		now := time.Now().UTC()
+		x, e = tx.Exec(`UPDATE jobs SET state=?,received=received+?,chunks=chunks+1,last_activity_at=?,expires_at=? WHERE id=? AND state IN (?,?)`, uploading, want, now.Format(time.RFC3339Nano), uploadExpiry(now, s.cfg.UploadRetention), jid, admitted, uploading)
 		if e == nil {
 			updated, _ = x.RowsAffected()
 		}
@@ -302,7 +379,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	jid := r.PathValue("id")
-	mu := s.lock(jid, -1)
+	mu := s.lifecycleLock(jid)
 	mu.Lock()
 	defer mu.Unlock()
 	tx, e := s.db.Begin()
@@ -310,7 +387,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, e.Error())
 		return
 	}
-	x, e := tx.Exec(`UPDATE jobs SET state=? WHERE id=? AND state IN (?,?) AND received=size AND chunks=expected`, finalizing, jid, admitted, uploading)
+	x, e := tx.Exec(`UPDATE jobs SET state=?,last_activity_at=?,expires_at=NULL WHERE id=? AND state IN (?,?) AND received=size AND chunks=expected`, finalizing, time.Now().UTC().Format(time.RFC3339Nano), jid, admitted, uploading)
 	if e == nil {
 		e = tx.Commit()
 	} else {
@@ -323,7 +400,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	n, _ := x.RowsAffected()
 	if n != 1 {
 		j, z := s.job(jid)
-		if z == nil && (j.State == finalizing || j.State == staged || j.State == probing || j.State == validated || j.State == queued) {
+		if z == nil && processingOrCompletedState(j.State) {
 			out(w, http.StatusAccepted, APIJobStateResponse{ID: jid, State: j.State})
 			return
 		}
@@ -334,7 +411,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	out(w, http.StatusAccepted, APIJobStateResponse{ID: jid, State: finalizing})
 }
 func (s *Server) finalize(jid string) {
-	mu := s.lock(jid, -1)
+	mu := s.lifecycleLock(jid)
 	mu.Lock()
 	defer mu.Unlock()
 	part, in := filepath.Join(s.dir(jid), "input.part"), filepath.Join(s.dir(jid), "input")
@@ -422,6 +499,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		InputSHA256:      j.ActualHash,
 		Error:            nullable(j.Error),
 		OutputURL:        artifactURL(j),
+		ExpiresAt:        nullable(j.ExpiresAt),
 	})
 }
 func (s *Server) output(w http.ResponseWriter, r *http.Request) {
@@ -471,7 +549,8 @@ func (s *Server) admitPending() {
 			s.fail(j.ID, fmt.Errorf("spool preallocation: %w", e))
 			continue
 		}
-		result, e := s.db.Exec(`UPDATE jobs SET state=? WHERE id=? AND state=? AND reserved=?`, admitted, j.ID, pending, j.Reserved)
+		now := time.Now().UTC()
+		result, e := s.db.Exec(`UPDATE jobs SET state=?,last_activity_at=?,expires_at=? WHERE id=? AND state=? AND reserved=?`, admitted, now.Format(time.RFC3339Nano), uploadExpiry(now, s.cfg.UploadRetention), j.ID, pending, j.Reserved)
 		if e != nil {
 			s.fail(j.ID, e)
 			continue
@@ -487,7 +566,7 @@ var errCapacityUnavailable = errors.New("spool capacity temporarily unavailable"
 
 func (s *Server) oldestPendingJob() (Job, error) {
 	var j Job
-	e := s.db.QueryRow(`SELECT id,size,spec,reserved FROM jobs WHERE state=? ORDER BY created_at,id LIMIT 1`, pending).Scan(&j.ID, &j.Size, &j.Spec, &j.Reserved)
+	e := s.db.QueryRow(`SELECT id,size,spec,reserved FROM jobs WHERE state=? AND julianday(expires_at)>julianday(?) ORDER BY created_at,id LIMIT 1`, pending, time.Now().UTC().Format(time.RFC3339Nano)).Scan(&j.ID, &j.Size, &j.Spec, &j.Reserved)
 	return j, e
 }
 
@@ -549,23 +628,211 @@ func (s *Server) prepareInput(j Job) error {
 
 func (s *Server) job(id string) (Job, error) {
 	var j Job
-	e := s.db.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact,created_at FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.State, &j.Filename, &j.Size, &j.Received, &j.Chunks, &j.Expected, &j.Spec, &j.InputHash, &j.ActualHash, &j.Reserved, &j.Error, &j.Artifact, &j.CreatedAt)
+	e := s.db.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,chunk_size,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact,created_at,expires_at FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.State, &j.Filename, &j.Size, &j.Received, &j.Chunks, &j.Expected, &j.ChunkSize, &j.Spec, &j.InputHash, &j.ActualHash, &j.Reserved, &j.Error, &j.Artifact, &j.CreatedAt, &j.ExpiresAt)
 	return j, e
 }
-func (s *Server) recover() {
-	s.db.Exec(`UPDATE jobs SET state=? WHERE state=?`, admitted, "CREATED")
-	s.db.Exec(`UPDATE jobs SET state=? WHERE state IN (?,?)`, queued, starting, transcoding)
+func (s *Server) recover() error {
+	if e := s.expireUploads(time.Now().UTC()); e != nil {
+		return e
+	}
+	if e := s.reconcileResumableUploads(); e != nil {
+		return e
+	}
+	if _, e := s.db.Exec(`UPDATE jobs SET state=? WHERE state IN (?,?)`, queued, starting, transcoding); e != nil {
+		return e
+	}
 	rows, e := s.db.Query(`SELECT id FROM jobs WHERE state=?`, finalizing)
-	if e == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var i string
-			rows.Scan(&i)
-			go s.finalize(i)
+	if e != nil {
+		return e
+	}
+	var finalizingJobs []string
+	for rows.Next() {
+		var jobID string
+		if e = rows.Scan(&jobID); e != nil {
+			rows.Close()
+			return e
 		}
+		finalizingJobs = append(finalizingJobs, jobID)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	for _, jobID := range finalizingJobs {
+		go s.finalize(jobID)
 	}
 	go s.admitPending()
 	s.schedule()
+	return nil
+}
+
+func (s *Server) runUploadGC() {
+	interval := s.cfg.UploadRetention / 24
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	if interval > time.Hour {
+		interval = time.Hour
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		if e := s.expireUploads(now.UTC()); e != nil {
+			s.log.Error("expire abandoned uploads", "error", e)
+		}
+	}
+}
+
+func (s *Server) expireUploads(now time.Time) error {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	rows, e := s.db.Query(`SELECT id FROM jobs WHERE state IN (?,?,?) AND expires_at IS NOT NULL AND julianday(expires_at)<=julianday(?) ORDER BY expires_at`, pending, admitted, uploading, now.Format(time.RFC3339Nano))
+	if e != nil {
+		return e
+	}
+	var candidates []string
+	for rows.Next() {
+		var jobID string
+		if e = rows.Scan(&jobID); e != nil {
+			rows.Close()
+			return e
+		}
+		candidates = append(candidates, jobID)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	for _, jobID := range candidates {
+		if e = s.expireUpload(jobID, now); e != nil {
+			return e
+		}
+	}
+	if len(candidates) > 0 {
+		go s.admitPending()
+	}
+	return nil
+}
+
+func (s *Server) expireUpload(jobID string, now time.Time) error {
+	mu := s.lifecycleLock(jobID)
+	mu.Lock()
+	defer mu.Unlock()
+	tx, e := s.db.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	var reserved int64
+	if e = tx.QueryRow(`SELECT reserved FROM jobs WHERE id=? AND state IN (?,?,?) AND julianday(expires_at)<=julianday(?)`, jobID, pending, admitted, uploading, now.Format(time.RFC3339Nano)).Scan(&reserved); e == sql.ErrNoRows {
+		return nil
+	} else if e != nil {
+		return e
+	}
+	result, e := tx.Exec(`UPDATE jobs SET state=?,reserved=0,error=?,expires_at=NULL,finished_at=? WHERE id=? AND state IN (?,?,?) AND julianday(expires_at)<=julianday(?)`, expired, "upload expired after inactivity", now.Format(time.RFC3339Nano), jobID, pending, admitted, uploading, now.Format(time.RFC3339Nano))
+	if e != nil {
+		return e
+	}
+	changed, e := result.RowsAffected()
+	if e != nil || changed == 0 {
+		return e
+	}
+	if _, e = tx.Exec(`DELETE FROM chunks WHERE job_id=?`, jobID); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`DELETE FROM reservations WHERE job_id=?`, jobID); e != nil {
+		return e
+	}
+	if reserved > 0 {
+		if _, e = tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, reserved); e != nil {
+			return e
+		}
+	}
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	if e = os.RemoveAll(s.dir(jobID)); e != nil {
+		s.log.Error("remove expired upload spool", "id", jobID, "error", e)
+	}
+	s.log.Info("upload expired", "id", jobID)
+	return nil
+}
+
+func (s *Server) reconcileResumableUploads() error {
+	rows, e := s.db.Query(`SELECT id,size FROM jobs WHERE state IN (?,?) ORDER BY created_at`, admitted, uploading)
+	if e != nil {
+		return e
+	}
+	type resumableUpload struct {
+		id   string
+		size int64
+	}
+	var uploads []resumableUpload
+	for rows.Next() {
+		var upload resumableUpload
+		if e = rows.Scan(&upload.id, &upload.size); e != nil {
+			rows.Close()
+			return e
+		}
+		uploads = append(uploads, upload)
+	}
+	if e = rows.Err(); e != nil {
+		rows.Close()
+		return e
+	}
+	rows.Close()
+	for _, upload := range uploads {
+		info, statErr := os.Stat(filepath.Join(s.dir(upload.id), "input.part"))
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() != upload.size {
+			detail := "spool input is missing or has an unexpected size"
+			if statErr != nil {
+				detail = fmt.Sprintf("spool input unavailable: %v", statErr)
+			}
+			if e = s.failUpload(upload.id, errors.New(detail)); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) failUpload(jobID string, cause error) error {
+	mu := s.lifecycleLock(jobID)
+	mu.Lock()
+	defer mu.Unlock()
+	tx, e := s.db.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	var reserved int64
+	if e = tx.QueryRow(`SELECT reserved FROM jobs WHERE id=? AND state IN (?,?)`, jobID, admitted, uploading).Scan(&reserved); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`UPDATE jobs SET state=?,reserved=0,error=?,expires_at=NULL,finished_at=? WHERE id=?`, failed, cause.Error(), time.Now().UTC().Format(time.RFC3339Nano), jobID); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`DELETE FROM chunks WHERE job_id=?`, jobID); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`DELETE FROM reservations WHERE job_id=?`, jobID); e != nil {
+		return e
+	}
+	if reserved > 0 {
+		if _, e = tx.Exec(`UPDATE capacity SET reserved=MAX(reserved-?,0) WHERE id=1`, reserved); e != nil {
+			return e
+		}
+	}
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	if e = os.RemoveAll(s.dir(jobID)); e != nil {
+		s.log.Error("remove invalid resumable upload spool", "id", jobID, "error", e)
+	}
+	s.log.Error("resumable upload failed integrity check", "id", jobID, "error", cause)
+	return nil
 }
 func (s *Server) schedule() {
 	s.scheduleMu.Lock()
@@ -686,16 +953,20 @@ func (s *Server) sandbox(c *cgroup, in, output string, program []string) *exec.C
 }
 func (s *Server) dir(id string) string       { return filepath.Join(s.cfg.Data, "spool", id) }
 func (s *Server) outputDir(id string) string { return filepath.Join(s.cfg.Output, id) }
-func (s *Server) chunkBytes(size int64, n int) int64 {
-	v := size - int64(n)*s.cfg.Chunk
-	if v < s.cfg.Chunk {
+func chunkBytes(size, chunkSize int64, n int) int64 {
+	v := size - int64(n)*chunkSize
+	if v < chunkSize {
 		return v
 	}
-	return s.cfg.Chunk
+	return chunkSize
 }
-func (s *Server) lock(j string, n int) *sync.Mutex {
-	k := j + ":" + strconv.Itoa(n)
-	v, _ := s.locks.LoadOrStore(k, &sync.Mutex{})
+func (s *Server) lifecycleLock(jobID string) *sync.RWMutex {
+	v, _ := s.lifecycleLocks.LoadOrStore(jobID, &sync.RWMutex{})
+	return v.(*sync.RWMutex)
+}
+func (s *Server) chunkLock(jobID string, number int) *sync.Mutex {
+	k := jobID + ":" + strconv.Itoa(number)
+	v, _ := s.chunkLocks.LoadOrStore(k, &sync.Mutex{})
 	return v.(*sync.Mutex)
 }
 
@@ -737,7 +1008,7 @@ func normalize(r Request, c Config) (Output, error) {
 	if r.Input.Size <= 0 || r.Input.Size > c.Capacity || validateFilename(r.Input.Filename) != nil {
 		return Output{}, errors.New("invalid input")
 	}
-	if r.Input.SHA256 != "" && len(r.Input.SHA256) != 64 {
+	if r.Input.SHA256 != "" && !validSHA256(r.Input.SHA256) {
 		return Output{}, errors.New("input sha256 must be hex SHA-256")
 	}
 	base := Output{Container: "mp4", Video: Video{Codec: "h264", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
@@ -919,7 +1190,40 @@ func (s *Server) uploadInstructions(j Job) *APIUploadInstructions {
 	if j.State != admitted && j.State != uploading {
 		return nil
 	}
-	return &APIUploadInstructions{Mode: "chunked", ChunkSize: s.cfg.Chunk, RequiredHeader: "X-Chunk-SHA256"}
+	return &APIUploadInstructions{Mode: "chunked", ChunkSize: j.ChunkSize, RequiredHeader: "X-Chunk-SHA256"}
+}
+
+func (s *Server) createJobResponse(j Job) APICreateJobResponse {
+	return APICreateJobResponse{ID: j.ID, State: j.State, ReservationBytes: j.Reserved, Upload: s.uploadInstructions(j), ExpiresAt: nullable(j.ExpiresAt)}
+}
+
+func processingOrCompletedState(state string) bool {
+	switch state {
+	case finalizing, staged, probing, validated, queued, starting, transcoding, completed:
+		return true
+	default:
+		return false
+	}
+}
+
+func validIdempotencyKey(key string) bool {
+	if len(key) < 16 || len(key) > 128 {
+		return false
+	}
+	for index, r := range key {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || (index > 0 && strings.ContainsRune("._:-", r)) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func uploadExpiry(now time.Time, retention time.Duration) string {
+	if retention <= 0 {
+		retention = 7 * 24 * time.Hour
+	}
+	return now.Add(retention).Format(time.RFC3339Nano)
 }
 func truncate(x string, n int) string {
 	if n <= 0 {
@@ -942,7 +1246,11 @@ func configFromEnv() (Config, error) {
 	if e := validateOutputDir(dataDir, outputDir); e != nil {
 		return Config{}, e
 	}
-	return Config{Data: dataDir, Output: outputDir, Listen: env("LISTEN_ADDR", ":8080"), Capacity: envI("SPOOL_CAPACITY_BYTES", 2<<40), Chunk: envI("CHUNK_SIZE_BYTES", 64<<20), Active: int(envI("MAX_ACTIVE_TRANSCODES", 2)), Cgroup: os.Getenv("CGROUP_ROOT"), RequireCgroup: envB("REQUIRE_CGROUP", true), RequireLandlock: envB("REQUIRE_LANDLOCK", true), MaxWidth: int(envI("MAX_WIDTH", 7680)), MaxHeight: int(envI("MAX_HEIGHT", 4320)), MaxStreams: int(envI("MAX_STREAMS", 64)), MaxDuration: float64(envI("MAX_DURATION_SECONDS", 86400))}, nil
+	retention, e := time.ParseDuration(env("UPLOAD_RETENTION", "168h"))
+	if e != nil || retention <= 0 {
+		return Config{}, errors.New("UPLOAD_RETENTION must be a positive Go duration")
+	}
+	return Config{Data: dataDir, Output: outputDir, Listen: env("LISTEN_ADDR", ":8080"), Capacity: envI("SPOOL_CAPACITY_BYTES", 2<<40), Chunk: envI("CHUNK_SIZE_BYTES", 64<<20), Active: int(envI("MAX_ACTIVE_TRANSCODES", 2)), Cgroup: os.Getenv("CGROUP_ROOT"), RequireCgroup: envB("REQUIRE_CGROUP", true), RequireLandlock: envB("REQUIRE_LANDLOCK", true), MaxWidth: int(envI("MAX_WIDTH", 7680)), MaxHeight: int(envI("MAX_HEIGHT", 4320)), MaxStreams: int(envI("MAX_STREAMS", 64)), MaxDuration: float64(envI("MAX_DURATION_SECONDS", 86400)), UploadRetention: retention}, nil
 }
 func validateOutputDir(dataDir, outputDir string) error {
 	if outputDir == "" {

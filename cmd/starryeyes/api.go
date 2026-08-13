@@ -14,6 +14,8 @@ type APICapabilitiesResponse = apispec.APICapabilitiesResponse
 type APIUploadInstructions = apispec.APIUploadInstructions
 type APICreateJobResponse = apispec.APICreateJobResponse
 type APIChunkResponse = apispec.APIChunkResponse
+type APIVerifiedChunk = apispec.APIVerifiedChunk
+type APIChunksResponse = apispec.APIChunksResponse
 type APIJobStateResponse = apispec.APIJobStateResponse
 type APIJobResponse = apispec.APIJobResponse
 
@@ -32,6 +34,7 @@ func newRouter(s *Server) http.Handler {
 		Health:       s.health,
 		Capabilities: s.cap,
 		CreateJob:    s.create,
+		ListChunks:   s.listChunks,
 		UploadChunk:  s.chunk,
 		CompleteJob:  s.complete,
 		GetJob:       s.get,

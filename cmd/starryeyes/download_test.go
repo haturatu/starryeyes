@@ -78,7 +78,7 @@ func TestOutputSetsOriginalDownloadFilename(t *testing.T) {
 	if err := os.WriteFile(artifactPath, []byte("converted media"), 0640); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.db.Exec(`INSERT INTO jobs(id,state,filename,size,expected,spec,reserved,created_at,artifact) VALUES(?,?,?,?,?,?,?,?,?)`, jobID, completed, "旅行動画.mov", 1, 1, "{}", 0, time.Now().UTC(), artifact); err != nil {
+	if _, err := server.db.Exec(`INSERT INTO jobs(id,state,filename,size,expected,chunk_size,spec,reserved,created_at,artifact) VALUES(?,?,?,?,?,?,?,?,?,?)`, jobID, completed, "旅行動画.mov", 1, 1, 1, "{}", 0, time.Now().UTC(), artifact); err != nil {
 		t.Fatal(err)
 	}
 

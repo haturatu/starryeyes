@@ -11,6 +11,7 @@ Environment=OUTPUT_DIR=/mnt/starryeyes-output
 Environment=CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
 Environment=REQUIRE_CGROUP=true
 Environment=REQUIRE_LANDLOCK=true
+Environment=UPLOAD_RETENTION=168h
 Delegate=yes
 TasksMax=infinity
 NoNewPrivileges=yes

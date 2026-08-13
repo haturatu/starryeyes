@@ -26,6 +26,9 @@ jobs:
           gofmt_output="$(find . -type f -name '*.go' -not -path './vendor/*' -exec gofmt -l {} +)"
           test -z "$gofmt_output"
 
+      - name: Check Bash syntax
+        run: bash -n scripts/upload-directory.sh
+
       - name: Run Go vet
         run: go vet ./...
 

@@ -48,8 +48,8 @@ func TestOpenAPIContract(t *testing.T) {
 		t.Errorf("OpenAPI version = %q, want 3.1.0", document["openapi"])
 	}
 	info := object(t, document["info"])
-	if info["title"] != "Starryeyes API" || info["version"] != "1.0.0" {
-		t.Errorf("API info = %#v, want Starryeyes API 1.0.0", info)
+	if info["title"] != "Starryeyes API" || info["version"] != "2.0.0" {
+		t.Errorf("API info = %#v, want Starryeyes API 2.0.0", info)
 	}
 
 	paths := object(t, document["paths"])
@@ -57,6 +57,7 @@ func TestOpenAPIContract(t *testing.T) {
 		"/healthz",
 		"/v1/capabilities",
 		"/v1/jobs",
+		"/v1/jobs/{id}/chunks",
 		"/v1/jobs/{id}/chunks/{chunk}",
 		"/v1/jobs/{id}/complete",
 		"/v1/jobs/{id}",
@@ -74,6 +75,12 @@ func TestOpenAPIContract(t *testing.T) {
 	}
 	if _, ok := object(t, create["responses"])["201"]; !ok {
 		t.Error("createJob does not document a 201 response")
+	}
+	assertRequiredHeader(t, create, "Idempotency-Key")
+
+	listChunks := operation(t, paths, "/v1/jobs/{id}/chunks", "get")
+	if _, ok := object(t, listChunks["responses"])["200"]; !ok {
+		t.Error("listVerifiedChunks does not document a 200 response")
 	}
 
 	chunk := operation(t, paths, "/v1/jobs/{id}/chunks/{chunk}", "put")
@@ -108,7 +115,13 @@ func TestOpenAPIContract(t *testing.T) {
 func TestAPITypedResponses(t *testing.T) {
 	service, server := newAPITestServer(t)
 	payload := []byte(`{"input":{"filename":"clip.mp4","size":1024},"output":{"preset":"web-1080p"}}`)
-	response, err := http.Post(server.URL+"/v1/jobs", "application/json", bytes.NewReader(payload))
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "typed-response-test-key")
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +154,13 @@ func TestAPITypedResponses(t *testing.T) {
 		t.Errorf("job response = %#v, want an admitted job with upload instructions", job)
 	}
 
-	invalid, err := http.Post(server.URL+"/v1/jobs", "application/json", bytes.NewBufferString("{"))
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewBufferString("{"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "invalid-json-test-key")
+	invalid, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +219,13 @@ func TestUploadAdmissionQueue(t *testing.T) {
 func createAPITestJob(t *testing.T, baseURL string, size int64) APICreateJobResponse {
 	t.Helper()
 	payload := []byte(`{"input":{"filename":"clip.mp4","size":` + strconv.FormatInt(size, 10) + `},"output":{"preset":"web-1080p"}}`)
-	response, err := http.Post(baseURL+"/v1/jobs", "application/json", bytes.NewReader(payload))
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", id()+id())
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +280,7 @@ func newAPITestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Cleanup(func() { db.Close() })
 	server := &Server{
 		db:  db,
-		cfg: Config{Data: dataDir, Output: outputDir, Capacity: 8 << 20, Chunk: 1 << 20, Active: 1, MaxWidth: 7680, MaxHeight: 4320, MaxStreams: 64, MaxDuration: 86400},
+		cfg: Config{Data: dataDir, Output: outputDir, Capacity: 8 << 20, Chunk: 1 << 20, Active: 1, MaxWidth: 7680, MaxHeight: 4320, MaxStreams: 64, MaxDuration: 86400, UploadRetention: 7 * 24 * time.Hour},
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		sem: make(chan struct{}, 1),
 	}
@@ -328,6 +353,21 @@ func assertChecksumHeader(t *testing.T, operation map[string]any) {
 		return
 	}
 	t.Error("uploadChunk does not document X-Chunk-SHA256")
+}
+
+func assertRequiredHeader(t *testing.T, operation map[string]any, name string) {
+	t.Helper()
+	parameters, ok := operation["parameters"].([]any)
+	if !ok {
+		t.Fatalf("operation has no documented %s header", name)
+	}
+	for _, parameter := range parameters {
+		value := object(t, parameter)
+		if value["name"] == name && value["in"] == "header" && value["required"] == true {
+			return
+		}
+	}
+	t.Errorf("operation does not document required %s header", name)
 }
 
 func assertRequestSchemaConstraints(t *testing.T, schemas map[string]any) {

@@ -41,15 +41,28 @@ type APIUploadInstructions struct {
 
 type APICreateJobResponse struct {
 	ID               string                 `json:"id" doc:"Created job identifier."`
-	State            string                 `json:"state" doc:"Initial job state. A new job starts as PENDING while it waits for local spool capacity."`
+	State            string                 `json:"state" doc:"Current job state. A new job starts as PENDING while it waits for local spool capacity."`
 	ReservationBytes int64                  `json:"reservation_bytes" doc:"Spool capacity currently reserved for this job; zero while pending."`
 	Upload           *APIUploadInstructions `json:"upload,omitempty" doc:"Instructions for uploading the input file, present only after admission."`
+	ExpiresAt        *string                `json:"expires_at,omitempty" doc:"Upload expiration time in RFC 3339 format while the job is resumable."`
 }
 
 type APIChunkResponse struct {
 	Chunk  int    `json:"chunk" doc:"Uploaded chunk number."`
 	Bytes  int64  `json:"bytes,omitempty" doc:"Number of bytes accepted for a newly uploaded chunk."`
 	Status string `json:"status" doc:"Chunk upload result."`
+}
+
+type APIVerifiedChunk struct {
+	Number int    `json:"number" minimum:"0" doc:"Zero-based chunk number."`
+	Size   int64  `json:"size" minimum:"1" doc:"Verified chunk size in bytes."`
+	SHA256 string `json:"sha256" pattern:"^[0-9a-f]{64}$" doc:"Lowercase hexadecimal SHA-256 of the verified chunk."`
+}
+
+type APIChunksResponse struct {
+	ChunkSize int64              `json:"chunk_size" minimum:"1" doc:"Required chunk size in bytes, except for the final chunk."`
+	Expected  int                `json:"expected" minimum:"1" doc:"Total number of chunks required for the input."`
+	Chunks    []APIVerifiedChunk `json:"chunks" doc:"Server-authoritative list of verified chunks, ordered by chunk number."`
 }
 
 type APIJobStateResponse struct {
@@ -70,6 +83,7 @@ type APIJobResponse struct {
 	InputSHA256      string                 `json:"input_sha256" doc:"Verified SHA-256 of the completed input, when available."`
 	Error            *string                `json:"error" doc:"Processing failure detail, when the job failed."`
 	OutputURL        *string                `json:"output_url" doc:"URL of the completed output artifact, when available."`
+	ExpiresAt        *string                `json:"expires_at,omitempty" doc:"Upload expiration time in RFC 3339 format while the job is resumable."`
 }
 
 type Input struct {
@@ -110,13 +124,13 @@ type Audio struct {
 
 // Handlers is the runtime implementation for the documented operations.
 type Handlers struct {
-	Health, Capabilities, CreateJob, UploadChunk, CompleteJob, GetJob, Output http.HandlerFunc
+	Health, Capabilities, CreateJob, ListChunks, UploadChunk, CompleteJob, GetJob, Output http.HandlerFunc
 }
 
 // Config returns the shared API configuration without a fixed server URL.
 // Runtime documentation therefore targets the server that served it.
 func Config() huma.Config {
-	config := huma.DefaultConfig("Starryeyes API", "1.0.0")
+	config := huma.DefaultConfig("Starryeyes API", "2.0.0")
 	// Avoid adding $schema to established JSON responses.
 	config.CreateHooks = nil
 	return config
@@ -145,12 +159,29 @@ func Register(api huma.API, handlers Handlers) {
 		Method:      http.MethodPost,
 		Path:        "/v1/jobs",
 		Summary:     "Create a media conversion job and place it in the upload-admission queue",
+		Description: "Persist a client-generated idempotency key before this request. Repeating the same key and body returns the same job; reusing a key with a different body returns 409.",
+		Parameters: []*huma.Param{
+			{Name: "Idempotency-Key", In: "header", Required: true, Description: "Client-generated upload workflow identifier, 16 through 128 characters.", Schema: &huma.Schema{Type: huma.TypeString, MinLength: ptr(16), MaxLength: ptr(128), Pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"}},
+		},
 		RequestBody: jsonRequestBody(jsonSchema[Request](api), "Job input and requested output specification"),
 		Responses: mergeResponses(
-			responses(jsonSchema[APICreateJobResponse](api), http.StatusCreated, "Job accepted in the upload-admission queue"),
-			errorResponses(api, http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusInternalServerError),
+			responses(jsonSchema[APICreateJobResponse](api), http.StatusCreated, "Job created, or the existing job returned for an identical idempotent replay"),
+			errorResponses(api, http.StatusBadRequest, http.StatusConflict, http.StatusUnprocessableEntity, http.StatusInternalServerError),
 		),
 	}, handlers.CreateJob)
+
+	registerHumaHandler(api, huma.Operation{
+		OperationID: "listVerifiedChunks",
+		Method:      http.MethodGet,
+		Path:        "/v1/jobs/{id}/chunks",
+		Summary:     "List verified upload chunks",
+		Description: "This response is the source of truth when resuming an upload. Clients should upload only chunk numbers absent from the list.",
+		Parameters:  []*huma.Param{pathParam("id", "Job identifier.", &huma.Schema{Type: huma.TypeString})},
+		Responses: mergeResponses(
+			responses(jsonSchema[APIChunksResponse](api), http.StatusOK, "Server-authoritative verified chunks"),
+			errorResponses(api, http.StatusNotFound, http.StatusInternalServerError),
+		),
+	}, handlers.ListChunks)
 
 	registerHumaHandler(api, huma.Operation{
 		OperationID: "uploadChunk",
@@ -179,7 +210,7 @@ func Register(api huma.API, handlers Handlers) {
 		Summary:     "Finalize an uploaded job",
 		Parameters:  []*huma.Param{pathParam("id", "Job identifier.", &huma.Schema{Type: huma.TypeString})},
 		Responses: mergeResponses(
-			responses(jsonSchema[APIJobStateResponse](api), http.StatusAccepted, "Job finalization started or is already underway"),
+			responses(jsonSchema[APIJobStateResponse](api), http.StatusAccepted, "Job finalization started or the job is already finalizing, processing, or completed"),
 			errorResponses(api, http.StatusConflict, http.StatusInternalServerError),
 		),
 	}, handlers.CompleteJob)

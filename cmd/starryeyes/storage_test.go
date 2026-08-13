@@ -3,6 +3,7 @@ package main
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestConfigFromEnvRequiresSeparateOutputDirectory(t *testing.T) {
@@ -32,6 +33,13 @@ func TestConfigFromEnvRequiresSeparateOutputDirectory(t *testing.T) {
 	}
 	if cfg.Data != dataDir || cfg.Output != outputDir {
 		t.Errorf("config = %#v, want Data=%q and Output=%q", cfg, dataDir, outputDir)
+	}
+	if cfg.UploadRetention != 7*24*time.Hour {
+		t.Errorf("UploadRetention = %s, want 168h", cfg.UploadRetention)
+	}
+	t.Setenv("UPLOAD_RETENTION", "invalid")
+	if _, err := configFromEnv(); err == nil {
+		t.Error("configFromEnv accepted an invalid UPLOAD_RETENTION")
 	}
 }
 
