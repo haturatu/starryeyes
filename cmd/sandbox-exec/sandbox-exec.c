@@ -35,7 +35,7 @@ static void allow_path(int ruleset, const char *path, uint64_t rights) {
   if(ll_add(ruleset,&a)<0) die("landlock_add_rule");
   close(fd);
 }
-static void landlock(const char *input, const char *output) {
+static void landlock(const char *input, const char *output, const char **gpu_devices, int gpu_count) {
   int abi=ll_create(NULL,0,LANDLOCK_CREATE_RULESET_VERSION);
   if(abi<REQUIRED_LANDLOCK_ABI) { fprintf(stderr,"Landlock ABI %d; need >= %d\n",abi,REQUIRED_LANDLOCK_ABI); exit(126); }
   uint64_t ro=LANDLOCK_ACCESS_FS_EXECUTE|LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_READ_DIR;
@@ -52,6 +52,7 @@ static void landlock(const char *input, const char *output) {
   allow_path(fd,"/proc/sys",LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_READ_DIR);
   allow_path(fd,"/dev/null",LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_WRITE_FILE);
   allow_path(fd,"/dev/urandom",LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_WRITE_FILE);
+  for(int i=0;i<gpu_count;i++) allow_path(fd,gpu_devices[i],LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_WRITE_FILE);
   allow_path(fd,input,LANDLOCK_ACCESS_FS_READ_FILE);
   allow_path(fd,"/tmp",rw);
   if(output) allow_path(fd,output,rw);
@@ -61,11 +62,24 @@ static void landlock(const char *input, const char *output) {
 }
 static void deny(scmp_filter_ctx c,int nr){if(seccomp_rule_add(c,SCMP_ACT_ERRNO(EPERM),nr,0)<0)exit(126);}
 static void seccomp_cpu(void){scmp_filter_ctx c=seccomp_init(SCMP_ACT_ALLOW);if(!c)exit(126);deny(c,SCMP_SYS(socket));deny(c,SCMP_SYS(socketpair));deny(c,SCMP_SYS(connect));deny(c,SCMP_SYS(bind));deny(c,SCMP_SYS(listen));deny(c,SCMP_SYS(accept));deny(c,SCMP_SYS(accept4));deny(c,SCMP_SYS(sendto));deny(c,SCMP_SYS(recvfrom));deny(c,SCMP_SYS(unshare));deny(c,SCMP_SYS(setns));deny(c,SCMP_SYS(mount));deny(c,SCMP_SYS(umount2));deny(c,SCMP_SYS(pivot_root));deny(c,SCMP_SYS(ptrace));deny(c,SCMP_SYS(bpf));deny(c,SCMP_SYS(keyctl));deny(c,SCMP_SYS(kexec_load));if(seccomp_load(c)<0)die("seccomp_load");seccomp_release(c);}
+static int numeric_suffix(const char *path, const char *prefix) {
+  size_t n=strlen(prefix); if(strncmp(path,prefix,n)||!path[n]) return 0;
+  for(const char *p=path+n;*p;p++) if(*p<'0'||*p>'9') return 0;
+  return 1;
+}
+static int valid_gpu_device(const char *path) {
+  return numeric_suffix(path,"/dev/dri/renderD") || numeric_suffix(path,"/dev/nvidia") || !strcmp(path,"/dev/nvidiactl") || !strcmp(path,"/dev/nvidia-uvm") || !strcmp(path,"/dev/nvidia-uvm-tools");
+}
 int main(int argc,char **argv){
   if(argc==2&&!strcmp(argv[1],"--check")){int a=ll_create(NULL,0,LANDLOCK_CREATE_RULESET_VERSION);return a>=REQUIRED_LANDLOCK_ABI?0:1;}
   if(argc<7||strcmp(argv[1],"--profile")||strcmp(argv[2],"cpu")||strcmp(argv[3],"--input"))return 64;
-  const char *input=argv[4],*output=NULL;int i=5;
+  const char *input=argv[4],*output=NULL;const char **gpu_devices=calloc((size_t)argc,sizeof(*gpu_devices));int gpu_count=0,i=5;
+  if(!gpu_devices) return 126;
   if(i+1<argc&&!strcmp(argv[i],"--output")){output=argv[i+1];i+=2;}
+  while(i+1<argc&&!strcmp(argv[i],"--gpu-device")){
+    if(!valid_gpu_device(argv[i+1])) return 64;
+    gpu_devices[gpu_count++]=argv[i+1];i+=2;
+  }
   if(i>=argc||strcmp(argv[i],"--")||i+1>=argc)return 64;
-  landlock(input,output);seccomp_cpu();execvp(argv[i+1],argv+i+1);die("execvp");
+  landlock(input,output,gpu_devices,gpu_count);seccomp_cpu();execvp(argv[i+1],argv+i+1);die("execvp");
 }

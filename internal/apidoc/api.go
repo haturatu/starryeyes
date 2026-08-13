@@ -26,11 +26,12 @@ type APILimits struct {
 }
 
 type APICapabilitiesResponse struct {
-	Containers  []string  `json:"containers" doc:"Supported output containers."`
-	VideoCodecs []string  `json:"video_codecs" doc:"Supported video codecs."`
-	AudioCodecs []string  `json:"audio_codecs" doc:"Supported audio codecs."`
-	Presets     []string  `json:"presets" doc:"Supported output presets."`
-	Limits      APILimits `json:"limits" doc:"Server-side media and upload limits."`
+	Containers    []string  `json:"containers" doc:"Supported output containers."`
+	VideoCodecs   []string  `json:"video_codecs" doc:"Supported video codecs."`
+	VideoEncoders []string  `json:"video_encoders" doc:"Video encoder modes accepted by the API. Hardware modes require their device to be exposed to the service."`
+	AudioCodecs   []string  `json:"audio_codecs" doc:"Supported audio codecs."`
+	Presets       []string  `json:"presets" doc:"Supported output presets."`
+	Limits        APILimits `json:"limits" doc:"Server-side media and upload limits."`
 }
 
 type APIUploadInstructions struct {
@@ -103,6 +104,7 @@ type Output struct {
 }
 type Video struct {
 	Codec      string     `json:"codec,omitempty" enum:"h264,hevc,av1,vp9" doc:"Video codec. Defaults to h264."`
+	Encoder    string     `json:"encoder,omitempty" enum:"auto,software,vaapi,nvenc" doc:"Encoder mode. Defaults to auto, which prefers a usable NVIDIA NVENC or VA-API encoder and retries with software if hardware encoding fails. software, vaapi, and nvenc require that mode and do not fall back."`
 	Quality    Quality    `json:"quality,omitempty" doc:"Quality mode. Set value for quality mode or crf for CRF mode."`
 	Resolution Resolution `json:"resolution,omitempty" doc:"Resolution mode. Width and height apply only when mode is fit."`
 }

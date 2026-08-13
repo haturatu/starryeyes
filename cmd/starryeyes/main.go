@@ -45,6 +45,7 @@ const (
 
 type Config struct {
 	Data, Output, Listen, Cgroup    string
+	VAAPIDevice                     string
 	Capacity, Chunk                 int64
 	Active                          int
 	RequireCgroup, RequireLandlock  bool
@@ -144,10 +145,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) cap(w http.ResponseWriter, r *http.Request) {
 	out(w, http.StatusOK, APICapabilitiesResponse{
-		Containers:  []string{"mp4", "mkv", "webm"},
-		VideoCodecs: []string{"h264", "hevc", "av1", "vp9"},
-		AudioCodecs: []string{"aac", "opus", "flac"},
-		Presets:     []string{"web-1080p", "archive-av1"},
+		Containers:    []string{"mp4", "mkv", "webm"},
+		VideoCodecs:   []string{"h264", "hevc", "av1", "vp9"},
+		VideoEncoders: []string{"auto", "software", "vaapi", "nvenc"},
+		AudioCodecs:   []string{"aac", "opus", "flac"},
+		Presets:       []string{"web-1080p", "archive-av1"},
 		Limits: APILimits{
 			ChunkSize:  s.cfg.Chunk,
 			MaxWidth:   s.cfg.MaxWidth,
@@ -879,12 +881,33 @@ func (s *Server) run(jid string) {
 		return
 	}
 	artifact := "output." + o.Container
-	cmd := s.ffmpegCmd(cg, j, o, artifact)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	e = cmd.Run()
+	encoders, e := s.videoEncoders(o.Video)
 	if e != nil {
-		s.fail(jid, fmt.Errorf("transcode: %w: %s", e, truncate(stderr.String(), 1000)))
+		s.fail(jid, e)
+		return
+	}
+	var transcodeErr error
+	for _, selected := range encoders {
+		cmd := s.ffmpegCmd(cg, j, o, artifact, selected)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		e = cmd.Run()
+		if e == nil {
+			transcodeErr = nil
+			break
+		}
+		transcodeErr = fmt.Errorf("%s: %w: %s", selected.name, e, truncate(stderr.String(), 1000))
+		if !selected.hardware {
+			break
+		}
+		s.log.Warn("hardware video encoder failed; trying next auto fallback", "id", jid, "encoder", selected.name, "error", transcodeErr)
+		if removeErr := os.Remove(filepath.Join(dir, artifact)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			s.fail(jid, fmt.Errorf("remove failed hardware output: %w", removeErr))
+			return
+		}
+	}
+	if transcodeErr != nil {
+		s.fail(jid, fmt.Errorf("transcode: %w", transcodeErr))
 		return
 	}
 	completedAt := time.Now().UTC()
@@ -922,22 +945,42 @@ func (s *Server) release(j Job) {
 	}
 }
 func (s *Server) probeCmd(in string) *exec.Cmd {
-	return s.sandbox(nil, in, "", []string{"/usr/bin/ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", in})
+	return s.sandbox(nil, in, "", nil, []string{"/usr/bin/ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", in})
 }
-func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string) *exec.Cmd {
+func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected videoEncoder) *exec.Cmd {
 	in := filepath.Join(s.dir(j.ID), "input")
 	outDir := s.outputDir(j.ID)
-	a := []string{"/usr/bin/ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-protocol_whitelist", "file,pipe", "-i", in, "-map", "0:v:0?", "-map", "0:a?", "-c:v", encoder(o.Video.Codec), "-crf", strconv.Itoa(crf(o.Video)), "-pix_fmt", "yuv420p", "-c:a", audio(o.Audio.Codec), "-b:a", strconv.Itoa(o.Audio.BitrateKbps) + "k"}
-	if f := scale(o.Video.Resolution); f != "" {
-		a = append(a, "-vf", f)
+	a := []string{"/usr/bin/ffmpeg", "-y", "-nostdin", "-hide_banner", "-v", "error", "-protocol_whitelist", "file,pipe"}
+	if selected.mode == "vaapi" {
+		a = append(a, "-vaapi_device", selected.devices[0])
 	}
+	a = append(a, "-i", in, "-map", "0:v:0?", "-map", "0:a?", "-c:v", selected.name)
+	filter := scale(o.Video.Resolution)
+	if selected.mode == "vaapi" {
+		if filter != "" {
+			filter += ","
+		}
+		filter += "format=nv12,hwupload"
+	}
+	if filter != "" {
+		a = append(a, "-vf", filter)
+	}
+	switch selected.mode {
+	case "vaapi":
+		a = append(a, "-qp", strconv.Itoa(crf(o.Video)))
+	case "nvenc":
+		a = append(a, "-rc", "vbr", "-cq", strconv.Itoa(crf(o.Video)), "-pix_fmt", "yuv420p")
+	default:
+		a = append(a, "-crf", strconv.Itoa(crf(o.Video)), "-pix_fmt", "yuv420p")
+	}
+	a = append(a, "-c:a", audio(o.Audio.Codec), "-b:a", strconv.Itoa(o.Audio.BitrateKbps)+"k")
 	if o.Container == "mp4" {
 		a = append(a, "-movflags", "+faststart")
 	}
 	a = append(a, filepath.Join(outDir, artifact))
-	return s.sandbox(&c, in, outDir, a)
+	return s.sandbox(&c, in, outDir, selected.devices, a)
 }
-func (s *Server) sandbox(c *cgroup, in, output string, program []string) *exec.Cmd {
+func (s *Server) sandbox(c *cgroup, in, output string, gpuDevices, program []string) *exec.Cmd {
 	args := []string{"--cgroup", func() string {
 		if c != nil {
 			return c.path
@@ -946,6 +989,9 @@ func (s *Server) sandbox(c *cgroup, in, output string, program []string) *exec.C
 	}(), "--", "/usr/local/bin/sandbox-exec", "--profile", "cpu", "--input", in}
 	if output != "" {
 		args = append(args, "--output", output)
+	}
+	for _, device := range gpuDevices {
+		args = append(args, "--gpu-device", device)
 	}
 	args = append(args, "--")
 	args = append(args, program...)
@@ -971,6 +1017,92 @@ func (s *Server) chunkLock(jobID string, number int) *sync.Mutex {
 }
 
 type cgroup struct{ path string }
+
+type videoEncoder struct {
+	mode, name string
+	devices    []string
+	hardware   bool
+}
+
+func (s *Server) videoEncoders(video Video) ([]videoEncoder, error) {
+	software := videoEncoder{mode: "software", name: softwareEncoder(video.Codec)}
+	switch video.Encoder {
+	case "software":
+		return []videoEncoder{software}, nil
+	case "vaapi":
+		device, ok := s.vaapiDevice()
+		if !ok {
+			return nil, errors.New("VA-API encoder requested but VAAPI_DEVICE is not an accessible render node")
+		}
+		return []videoEncoder{{mode: "vaapi", name: video.Codec + "_vaapi", devices: []string{device}, hardware: true}}, nil
+	case "nvenc":
+		devices := nvidiaDevices()
+		if len(devices) == 0 {
+			return nil, errors.New("NVENC encoder requested but NVIDIA device nodes are unavailable")
+		}
+		return []videoEncoder{{mode: "nvenc", name: video.Codec + "_nvenc", devices: devices, hardware: true}}, nil
+	case "auto":
+		candidates := make([]videoEncoder, 0, 3)
+		if devices := nvidiaDevices(); len(devices) > 0 {
+			candidates = append(candidates, videoEncoder{mode: "nvenc", name: video.Codec + "_nvenc", devices: devices, hardware: true})
+		}
+		if device, ok := s.vaapiDevice(); ok {
+			candidates = append(candidates, videoEncoder{mode: "vaapi", name: video.Codec + "_vaapi", devices: []string{device}, hardware: true})
+		}
+		return append(candidates, software), nil
+	default:
+		return nil, errors.New("unsupported video encoder")
+	}
+}
+
+func (s *Server) vaapiDevice() (string, bool) {
+	if !vaapiRenderNode(s.cfg.VAAPIDevice) {
+		return "", false
+	}
+	return s.cfg.VAAPIDevice, charDevice(s.cfg.VAAPIDevice)
+}
+
+func vaapiRenderNode(path string) bool {
+	if filepath.Dir(path) != "/dev/dri" {
+		return false
+	}
+	name := strings.TrimPrefix(filepath.Base(path), "renderD")
+	if name == filepath.Base(path) || name == "" {
+		return false
+	}
+	for _, char := range name {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func nvidiaDevices() []string {
+	paths := []string{"/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"}
+	indexed, _ := filepath.Glob("/dev/nvidia[0-9]*")
+	paths = append(paths, indexed...)
+	devices := make([]string, 0, len(paths))
+	hasGPU := false
+	for _, path := range paths {
+		if !charDevice(path) {
+			continue
+		}
+		if strings.HasPrefix(filepath.Base(path), "nvidia") && len(filepath.Base(path)) > len("nvidia") && filepath.Base(path)[len("nvidia")] >= '0' && filepath.Base(path)[len("nvidia")] <= '9' {
+			hasGPU = true
+		}
+		devices = append(devices, path)
+	}
+	if !hasGPU {
+		return nil
+	}
+	return devices
+}
+
+func charDevice(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
 
 func (s *Server) makeCgroup(id string) (cgroup, error) {
 	if s.cfg.Cgroup == "" {
@@ -1011,13 +1143,13 @@ func normalize(r Request, c Config) (Output, error) {
 	if r.Input.SHA256 != "" && !validSHA256(r.Input.SHA256) {
 		return Output{}, errors.New("input sha256 must be hex SHA-256")
 	}
-	base := Output{Container: "mp4", Video: Video{Codec: "h264", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
+	base := Output{Container: "mp4", Video: Video{Codec: "h264", Encoder: "auto", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
 	if r.Output.Preset != "" {
 		switch r.Output.Preset {
 		case "web-1080p":
 			base.Video.Resolution = Resolution{Mode: "fit", Width: 1920, Height: 1080}
 		case "archive-av1":
-			base = Output{Container: "mkv", Video: Video{Codec: "av1", Quality: Quality{Mode: "quality", Value: 80}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "opus", BitrateKbps: 192}}
+			base = Output{Container: "mkv", Video: Video{Codec: "av1", Encoder: "auto", Quality: Quality{Mode: "quality", Value: 80}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "opus", BitrateKbps: 192}}
 		default:
 			return base, errors.New("unknown preset")
 		}
@@ -1025,6 +1157,9 @@ func normalize(r Request, c Config) (Output, error) {
 	o := merge(base, r.Output)
 	if !compatible(o) {
 		return o, errors.New("incompatible container/codec combination")
+	}
+	if o.Video.Encoder != "auto" && o.Video.Encoder != "software" && o.Video.Encoder != "vaapi" && o.Video.Encoder != "nvenc" {
+		return o, errors.New("unsupported video encoder")
 	}
 	if o.Audio.BitrateKbps < 16 || o.Audio.BitrateKbps > 512 {
 		return o, errors.New("audio bitrate out of range")
@@ -1054,6 +1189,9 @@ func merge(b, x Output) Output {
 	}
 	if x.Video.Codec != "" {
 		b.Video.Codec = x.Video.Codec
+	}
+	if x.Video.Encoder != "" {
+		b.Video.Encoder = x.Video.Encoder
 	}
 	if x.Video.Quality.Mode != "" {
 		b.Video.Quality.Mode = x.Video.Quality.Mode
@@ -1114,7 +1252,7 @@ func crf(v Video) int {
 	_, max := crfRange(v.Codec)
 	return max - (v.Quality.Value * max / 100)
 }
-func encoder(c string) string {
+func softwareEncoder(c string) string {
 	if c == "h264" {
 		return "libx264"
 	}
@@ -1250,7 +1388,7 @@ func configFromEnv() (Config, error) {
 	if e != nil || retention <= 0 {
 		return Config{}, errors.New("UPLOAD_RETENTION must be a positive Go duration")
 	}
-	return Config{Data: dataDir, Output: outputDir, Listen: env("LISTEN_ADDR", ":8080"), Capacity: envI("SPOOL_CAPACITY_BYTES", 2<<40), Chunk: envI("CHUNK_SIZE_BYTES", 64<<20), Active: int(envI("MAX_ACTIVE_TRANSCODES", 2)), Cgroup: os.Getenv("CGROUP_ROOT"), RequireCgroup: envB("REQUIRE_CGROUP", true), RequireLandlock: envB("REQUIRE_LANDLOCK", true), MaxWidth: int(envI("MAX_WIDTH", 7680)), MaxHeight: int(envI("MAX_HEIGHT", 4320)), MaxStreams: int(envI("MAX_STREAMS", 64)), MaxDuration: float64(envI("MAX_DURATION_SECONDS", 86400)), UploadRetention: retention}, nil
+	return Config{Data: dataDir, Output: outputDir, Listen: env("LISTEN_ADDR", ":8080"), Capacity: envI("SPOOL_CAPACITY_BYTES", 2<<40), Chunk: envI("CHUNK_SIZE_BYTES", 64<<20), Active: int(envI("MAX_ACTIVE_TRANSCODES", 2)), Cgroup: os.Getenv("CGROUP_ROOT"), VAAPIDevice: env("VAAPI_DEVICE", "/dev/dri/renderD128"), RequireCgroup: envB("REQUIRE_CGROUP", true), RequireLandlock: envB("REQUIRE_LANDLOCK", true), MaxWidth: int(envI("MAX_WIDTH", 7680)), MaxHeight: int(envI("MAX_HEIGHT", 4320)), MaxStreams: int(envI("MAX_STREAMS", 64)), MaxDuration: float64(envI("MAX_DURATION_SECONDS", 86400)), UploadRetention: retention}, nil
 }
 func validateOutputDir(dataDir, outputDir string) error {
 	if outputDir == "" {

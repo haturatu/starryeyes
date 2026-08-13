@@ -394,6 +394,7 @@ func assertRequestSchemaConstraints(t *testing.T, schemas map[string]any) {
 	video := object(t, schemas["Video"])
 	videoProperties := object(t, video["properties"])
 	assertEnum(t, object(t, videoProperties["codec"]), "h264", "hevc", "av1", "vp9")
+	assertEnum(t, object(t, videoProperties["encoder"]), "auto", "software", "vaapi", "nvenc")
 	quality := object(t, schemas["Quality"])
 	qualityProperties := object(t, quality["properties"])
 	assertEnum(t, object(t, qualityProperties["mode"]), "quality", "crf")
