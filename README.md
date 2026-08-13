@@ -45,19 +45,59 @@ docker compose up --build
 
 ### Hardware encoding with Docker
 
-The base Compose service deliberately does not expose GPU devices. For an Intel or AMD VA-API render node, set the host `render` group ID and start with the opt-in override; it passes the selected `/dev/dri/renderD*` node into the container and keeps the container unprivileged.
+The base Compose service deliberately does not expose GPU devices.
+
+#### AMD / VA-API
+
+For an Intel or AMD VA-API render node, layer `compose.vaapi.yaml` over the base configuration. It passes the selected `/dev/dri/renderD*` node into the container and keeps the container unprivileged. Set the host `render` group ID and an output directory first:
+
+```sh
+export RENDER_GID="$(getent group render | cut -d: -f3)"
+export OUTPUT_DIR_HOST=/mnt/media/starryeyes
+
+docker compose \
+  -f compose.yaml \
+  -f compose.vaapi.yaml \
+  up --build
+```
+
+`renderD128` is the default `VAAPI_DEVICE`, so it needs no additional setting. To use another render node, such as `renderD129`, include it in the launch command:
+
+```sh
+VAAPI_DEVICE=/dev/dri/renderD129 \
+RENDER_GID="$(getent group render | cut -d: -f3)" \
+OUTPUT_DIR_HOST=/mnt/media/starryeyes \
+docker compose -f compose.yaml -f compose.vaapi.yaml up --build
+```
+
+To inspect the final configuration before starting it:
 
 ```sh
 RENDER_GID="$(getent group render | cut -d: -f3)" \
-  docker compose -f compose.yaml -f compose.vaapi.yaml up --build
+OUTPUT_DIR_HOST=/mnt/media/starryeyes \
+docker compose -f compose.yaml -f compose.vaapi.yaml config
 ```
 
-Set the same `RENDER_GID` in `.env` for repeated runs. Use `VAAPI_DEVICE=/dev/dri/renderD129` when the desired host render node differs from the default. Starryeyes grants the selected node only to the sandboxed FFmpeg worker, not to the HTTP process generally.
+Set the same values in `.env` for repeated runs. Starryeyes grants the selected node only to the sandboxed FFmpeg worker, not to the HTTP process generally.
 
-For NVIDIA, install the NVIDIA Container Toolkit on the host and use the NVIDIA override instead; Docker supplies the required `/dev/nvidia*` nodes to FFmpeg. The override explicitly enables the Toolkit's `video,utility` driver capabilities, which are required by NVENC; it does not enable CUDA compute.
+#### NVIDIA / NVENC
+
+Install the NVIDIA Container Toolkit on the host and layer `compose.nvidia.yaml` over the base configuration. Docker supplies the required `/dev/nvidia*` nodes to FFmpeg. The override explicitly enables the Toolkit's `video,utility` driver capabilities, which are required by NVENC; it does not enable CUDA compute.
 
 ```sh
-docker compose -f compose.yaml -f compose.nvidia.yaml up --build
+export OUTPUT_DIR_HOST=/mnt/media/starryeyes
+
+docker compose \
+  -f compose.yaml \
+  -f compose.nvidia.yaml \
+  up --build
+```
+
+To inspect the NVIDIA configuration first:
+
+```sh
+OUTPUT_DIR_HOST=/mnt/media/starryeyes \
+docker compose -f compose.yaml -f compose.nvidia.yaml config
 ```
 
 ### rclone FUSE output storage
