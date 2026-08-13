@@ -158,4 +158,5 @@ go run ./cmd/gen-docs public
 cp .env.example .env
 docker compose config
 docker compose up --build
+sudo find /var/lib/starryeyes -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 ```
