@@ -892,7 +892,11 @@ func (s *Server) run(jid string) {
 	}
 	var transcodeErr error
 	for _, selected := range encoders {
-		cmd := s.ffmpegCmd(cg, j, o, artifact, selected)
+		cmd, e := s.ffmpegCmd(cg, j, o, artifact, selected)
+		if e != nil {
+			s.fail(jid, fmt.Errorf("build ffmpeg command: %w", e))
+			return
+		}
 		var stderr strings.Builder
 		cmd.Stderr = &stderr
 		e = cmd.Run()
@@ -951,7 +955,15 @@ func (s *Server) release(j Job) {
 func (s *Server) probeCmd(in string) *exec.Cmd {
 	return s.sandbox(nil, in, "", nil, []string{"/usr/bin/ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", in})
 }
-func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected videoEncoder) *exec.Cmd {
+func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected videoEncoder) (*exec.Cmd, error) {
+	quality, err := crf(o.Video)
+	if err != nil {
+		return nil, err
+	}
+	audioCodec, err := audioEncoder(o.Audio.Codec)
+	if err != nil {
+		return nil, err
+	}
 	in := filepath.Join(s.dir(j.ID), "input")
 	outDir := s.outputDir(j.ID)
 	a := []string{"/usr/bin/ffmpeg", "-y", "-nostdin", "-hide_banner", "-v", "error", "-protocol_whitelist", "file,pipe"}
@@ -971,18 +983,18 @@ func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected 
 	}
 	switch selected.mode {
 	case "vaapi":
-		a = append(a, "-qp", strconv.Itoa(crf(o.Video)))
+		a = append(a, "-qp", strconv.Itoa(quality))
 	case "nvenc":
-		a = append(a, "-rc", "vbr", "-cq", strconv.Itoa(crf(o.Video)), "-pix_fmt", "yuv420p")
+		a = append(a, "-rc", "vbr", "-cq", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
 	default:
-		a = append(a, "-crf", strconv.Itoa(crf(o.Video)), "-pix_fmt", "yuv420p")
+		a = append(a, "-crf", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
 	}
-	a = append(a, "-c:a", audio(o.Audio.Codec), "-b:a", strconv.Itoa(o.Audio.BitrateKbps)+"k")
+	a = append(a, "-c:a", audioCodec, "-b:a", strconv.Itoa(o.Audio.BitrateKbps)+"k")
 	if o.Container == "mp4" {
 		a = append(a, "-movflags", "+faststart")
 	}
 	a = append(a, filepath.Join(outDir, artifact))
-	return s.sandbox(&c, in, outDir, selected.devices, a)
+	return s.sandbox(&c, in, outDir, selected.devices, a), nil
 }
 func (s *Server) sandbox(c *cgroup, in, output string, gpuDevices, program []string) *exec.Cmd {
 	args := []string{"--cgroup", func() string {
@@ -1028,10 +1040,18 @@ type videoEncoder struct {
 	hardware   bool
 }
 
-var errUnsupportedEncoderCodec = errors.New("unsupported video encoder for codec")
+var (
+	errUnsupportedVideoCodec   = errors.New("unsupported video codec")
+	errUnsupportedAudioCodec   = errors.New("unsupported audio codec")
+	errUnsupportedEncoderCodec = errors.New("unsupported video encoder for codec")
+)
 
 func (s *Server) videoEncoders(video Video) ([]videoEncoder, error) {
-	software := videoEncoder{mode: "software", name: softwareEncoder(video.Codec)}
+	softwareName, err := softwareEncoder(video.Codec)
+	if err != nil {
+		return nil, err
+	}
+	software := videoEncoder{mode: "software", name: softwareName}
 	switch video.Encoder {
 	case "software":
 		return []videoEncoder{software}, nil
@@ -1198,7 +1218,10 @@ func normalize(r Request, c Config) (Output, error) {
 			return o, errors.New("quality out of range")
 		}
 	case "crf":
-		minCRF, maxCRF := crfRange(o.Video.Codec)
+		minCRF, maxCRF, err := crfRange(o.Video.Codec)
+		if err != nil {
+			return o, err
+		}
 		if o.Video.Quality.CRF < minCRF || o.Video.Quality.CRF > maxCRF {
 			return o, errors.New("CRF out of range")
 		}
@@ -1275,47 +1298,50 @@ func scale(r Resolution) string {
 	}
 	return fmt.Sprintf("scale=%d:%d%s:force_divisible_by=2", r.Width, r.Height, up)
 }
-func crfRange(codec string) (int, int) {
+func crfRange(codec string) (int, int, error) {
 	switch codec {
 	case "av1", "vp9":
-		return 0, 63
+		return 0, 63, nil
 	case "h264", "hevc":
-		return 0, 51
+		return 0, 51, nil
 	default:
-		panic("unsupported video codec: " + codec)
+		return 0, 0, fmt.Errorf("%w: %s", errUnsupportedVideoCodec, codec)
 	}
 }
-func crf(v Video) int {
+func crf(v Video) (int, error) {
+	_, max, err := crfRange(v.Codec)
+	if err != nil {
+		return 0, err
+	}
 	if v.Quality.Mode == "crf" {
-		return v.Quality.CRF
+		return v.Quality.CRF, nil
 	}
-	_, max := crfRange(v.Codec)
-	return max - (v.Quality.Value * max / 100)
+	return max - (v.Quality.Value * max / 100), nil
 }
-func softwareEncoder(codec string) string {
+func softwareEncoder(codec string) (string, error) {
 	switch codec {
 	case "h264":
-		return "libx264"
+		return "libx264", nil
 	case "hevc":
-		return "libx265"
+		return "libx265", nil
 	case "vp9":
-		return "libvpx-vp9"
+		return "libvpx-vp9", nil
 	case "av1":
-		return "libsvtav1"
+		return "libsvtav1", nil
 	default:
-		panic("unsupported video codec: " + codec)
+		return "", fmt.Errorf("%w: %s", errUnsupportedVideoCodec, codec)
 	}
 }
-func audio(codec string) string {
+func audioEncoder(codec string) (string, error) {
 	switch codec {
 	case "aac":
-		return "aac"
+		return "aac", nil
 	case "opus":
-		return "libopus"
+		return "libopus", nil
 	case "flac":
-		return "flac"
+		return "flac", nil
 	default:
-		panic("unsupported audio codec: " + codec)
+		return "", fmt.Errorf("%w: %s", errUnsupportedAudioCodec, codec)
 	}
 }
 func reservation(n int64, o Output) (int64, int64, int64) {

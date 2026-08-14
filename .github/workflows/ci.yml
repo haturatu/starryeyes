@@ -28,6 +28,8 @@ jobs:
 
       - name: Check Bash syntax
         run: bash -n scripts/upload-directory.sh
+      - name: Check sandbox test syntax
+        run: bash -n scripts/test-sandbox-exec.sh
 
       - name: Run Go vet
         run: go vet ./...

@@ -207,7 +207,7 @@ This schema intentionally does not migrate databases created before resumable up
 - Seccomp denies sockets, mount and namespace changes, ptrace, BPF, and other high-risk operations. FFmpeg and ffprobe additionally use `-protocol_whitelist file,pipe`.
 - cgroup v2 limits memory, swap, PIDs, CPU weight, and CPU quota per job. Production systemd deployment uses delegated cgroups via [deploy/starryeyes.service](deploy/starryeyes.service).
 - The Docker container has no added capabilities, no privileged mode, `no-new-privileges`, a read-only root filesystem, and a dedicated bind-mounted data directory.
-- GPU device access is opt-in through the Compose overrides. The sandbox allowlists only the VA-API render node or NVIDIA device nodes selected for the job.
+- GPU device access is opt-in through the Compose overrides. The sandbox allowlists only the VA-API render node or NVIDIA device nodes selected for the job; VA-API workers additionally receive read-only access to `/sys/dev`, `/sys/class/drm`, `/sys/bus`, and `/sys/devices`, plus read-only directory access to `/dev/dri`.
 
 Landlock controls access to the existing filesystem rather than creating a replacement root filesystem. Docker, seccomp, DAC, and host MAC policy remain part of the defense-in-depth boundary.
 
