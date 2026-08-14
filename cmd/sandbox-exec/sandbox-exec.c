@@ -35,6 +35,14 @@ static void allow_path(int ruleset, const char *path, uint64_t rights) {
   if(ll_add(ruleset,&a)<0) die("landlock_add_rule");
   close(fd);
 }
+/* Mesa/libdrm resolves DRM device metadata through these read-only sysfs trees. */
+static void allow_gpu_sysfs(int ruleset) {
+  uint64_t ro=LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_READ_DIR;
+  allow_path(ruleset,"/sys/dev",ro);
+  allow_path(ruleset,"/sys/class/drm",ro);
+  allow_path(ruleset,"/sys/bus",ro);
+  allow_path(ruleset,"/sys/devices",ro);
+}
 static void landlock(const char *input, const char *output, const char **gpu_devices, int gpu_count) {
   int abi=ll_create(NULL,0,LANDLOCK_CREATE_RULESET_VERSION);
   if(abi<REQUIRED_LANDLOCK_ABI) { fprintf(stderr,"Landlock ABI %d; need >= %d\n",abi,REQUIRED_LANDLOCK_ABI); exit(126); }
@@ -53,6 +61,11 @@ static void landlock(const char *input, const char *output, const char **gpu_dev
   allow_path(fd,"/dev/null",LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_WRITE_FILE);
   allow_path(fd,"/dev/urandom",LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_WRITE_FILE);
   for(int i=0;i<gpu_count;i++) allow_path(fd,gpu_devices[i],LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_WRITE_FILE);
+  if(gpu_count>0) {
+    /* libdrm also opens this directory to enumerate DRM nodes. */
+    allow_path(fd,"/dev/dri",LANDLOCK_ACCESS_FS_READ_DIR);
+    allow_gpu_sysfs(fd);
+  }
   allow_path(fd,input,LANDLOCK_ACCESS_FS_READ_FILE);
   allow_path(fd,"/tmp",rw);
   if(output) allow_path(fd,output,rw);
