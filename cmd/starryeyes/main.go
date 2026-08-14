@@ -1309,12 +1309,12 @@ func crfRange(codec string) (int, int, error) {
 	}
 }
 func crf(v Video) (int, error) {
-	if v.Quality.Mode == "crf" {
-		return v.Quality.CRF, nil
-	}
 	_, max, err := crfRange(v.Codec)
 	if err != nil {
 		return 0, err
+	}
+	if v.Quality.Mode == "crf" {
+		return v.Quality.CRF, nil
 	}
 	return max - (v.Quality.Value * max / 100), nil
 }
