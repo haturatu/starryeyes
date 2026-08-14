@@ -135,6 +135,26 @@ func loggerFromContext(ctx context.Context) *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+func validRequestID(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func requestID(headerValue string) string {
+	if validRequestID(headerValue) {
+		return headerValue
+	}
+	return id()
+}
+
 type responseRecorder struct {
 	http.ResponseWriter
 	status int
@@ -165,10 +185,7 @@ func requestLogging(logger *slog.Logger, next http.Handler) http.Handler {
 	}
 	logger = logger.With("component", "http")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestID := r.Header.Get("X-Request-ID")
-		if requestID == "" {
-			requestID = id()
-		}
+		requestID := requestID(r.Header.Get("X-Request-ID"))
 		w.Header().Set("X-Request-ID", requestID)
 		ctx := context.WithValue(r.Context(), requestIDContextKey, requestID)
 		ctx = context.WithValue(ctx, requestLogContextKey, logger)
@@ -182,11 +199,7 @@ func requestLogging(logger *slog.Logger, next http.Handler) http.Handler {
 			status = http.StatusOK
 		}
 		level := slog.LevelInfo
-		if status >= http.StatusInternalServerError {
-			level = slog.LevelError
-		} else if status >= http.StatusBadRequest {
-			level = slog.LevelWarn
-		} else if r.URL.Path == "/healthz" {
+		if r.URL.Path == "/healthz" && status < http.StatusBadRequest {
 			level = slog.LevelDebug
 		}
 		attrs := []any{
@@ -213,20 +226,17 @@ func jobIDFromPath(path string) string {
 }
 
 func internalError(w http.ResponseWriter, r *http.Request, status int, err error) {
-	requestID := requestIDFromContext(r.Context())
-	if requestID == "" {
-		requestID = r.Header.Get("X-Request-ID")
-		if requestID == "" {
-			requestID = id()
-		}
-		w.Header().Set("X-Request-ID", requestID)
+	requestIDValue := requestIDFromContext(r.Context())
+	if requestIDValue == "" {
+		requestIDValue = requestID(r.Header.Get("X-Request-ID"))
+		w.Header().Set("X-Request-ID", requestIDValue)
 	}
-	attrs := []any{"event", "http.error", "status", status, "request_id", requestID, "error", err}
+	attrs := []any{"event", "http.error", "status", status, "request_id", requestIDValue, "error", err}
 	if jobID := jobIDFromPath(r.URL.Path); jobID != "" {
 		attrs = append(attrs, "job_id", jobID)
 	}
 	loggerFromContext(r.Context()).Error("internal server error", attrs...)
-	out(w, status, APIError{Error: "internal server error", RequestID: requestID})
+	out(w, status, APIError{Error: "internal server error", RequestID: requestIDValue})
 }
 
 func (s *Server) component(name string) *slog.Logger {
