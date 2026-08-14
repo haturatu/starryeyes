@@ -892,7 +892,11 @@ func (s *Server) run(jid string) {
 	}
 	var transcodeErr error
 	for _, selected := range encoders {
-		cmd := s.ffmpegCmd(cg, j, o, artifact, selected)
+		cmd, e := s.ffmpegCmd(cg, j, o, artifact, selected)
+		if e != nil {
+			s.fail(jid, fmt.Errorf("build ffmpeg command: %w", e))
+			return
+		}
 		var stderr strings.Builder
 		cmd.Stderr = &stderr
 		e = cmd.Run()
@@ -951,7 +955,11 @@ func (s *Server) release(j Job) {
 func (s *Server) probeCmd(in string) *exec.Cmd {
 	return s.sandbox(nil, in, "", nil, []string{"/usr/bin/ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", in})
 }
-func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected videoEncoder) *exec.Cmd {
+func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected videoEncoder) (*exec.Cmd, error) {
+	audioCodec, err := audioEncoder(o.Audio.Codec)
+	if err != nil {
+		return nil, err
+	}
 	in := filepath.Join(s.dir(j.ID), "input")
 	outDir := s.outputDir(j.ID)
 	a := []string{"/usr/bin/ffmpeg", "-y", "-nostdin", "-hide_banner", "-v", "error", "-protocol_whitelist", "file,pipe"}
@@ -977,12 +985,12 @@ func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected 
 	default:
 		a = append(a, "-crf", strconv.Itoa(crf(o.Video)), "-pix_fmt", "yuv420p")
 	}
-	a = append(a, "-c:a", audio(o.Audio.Codec), "-b:a", strconv.Itoa(o.Audio.BitrateKbps)+"k")
+	a = append(a, "-c:a", audioCodec, "-b:a", strconv.Itoa(o.Audio.BitrateKbps)+"k")
 	if o.Container == "mp4" {
 		a = append(a, "-movflags", "+faststart")
 	}
 	a = append(a, filepath.Join(outDir, artifact))
-	return s.sandbox(&c, in, outDir, selected.devices, a)
+	return s.sandbox(&c, in, outDir, selected.devices, a), nil
 }
 func (s *Server) sandbox(c *cgroup, in, output string, gpuDevices, program []string) *exec.Cmd {
 	args := []string{"--cgroup", func() string {
@@ -1314,16 +1322,16 @@ func softwareEncoder(codec string) (string, error) {
 		return "", fmt.Errorf("%w: %s", errUnsupportedVideoCodec, codec)
 	}
 }
-func audio(codec string) string {
+func audioEncoder(codec string) (string, error) {
 	switch codec {
 	case "aac":
-		return "aac"
+		return "aac", nil
 	case "opus":
-		return "libopus"
+		return "libopus", nil
 	case "flac":
-		return "flac"
+		return "flac", nil
 	default:
-		panic("unsupported audio codec: " + codec)
+		return "", fmt.Errorf("%w: %s", errUnsupportedAudioCodec, codec)
 	}
 }
 func reservation(n int64, o Output) (int64, int64, int64) {

@@ -97,8 +97,9 @@ func TestAudioEncoderMapping(t *testing.T) {
 		"opus": "libopus",
 		"flac": "flac",
 	} {
-		if got := audio(codec); got != want {
-			t.Errorf("audio(%q) = %q, want %q", codec, got, want)
+		got, err := audioEncoder(codec)
+		if err != nil || got != want {
+			t.Errorf("audioEncoder(%q) = %q, %v; want %q, nil", codec, got, err, want)
 		}
 	}
 }
@@ -238,7 +239,10 @@ func TestFFmpegHardwareEncoderArguments(t *testing.T) {
 		Audio:     Audio{Codec: "aac", BitrateKbps: 160},
 	}
 
-	vaapi := server.ffmpegCmd(cgroup{}, job, requested, "output.mp4", videoEncoder{mode: "vaapi", name: "hevc_vaapi", devices: []string{"/dev/dri/renderD128"}})
+	vaapi, err := server.ffmpegCmd(cgroup{}, job, requested, "output.mp4", videoEncoder{mode: "vaapi", name: "hevc_vaapi", devices: []string{"/dev/dri/renderD128"}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !slices.Contains(vaapi.Args, "-vaapi_device") || !slices.Contains(vaapi.Args, "/dev/dri/renderD128") || !slices.Contains(vaapi.Args, "hevc_vaapi") {
 		t.Errorf("VA-API command lacks device or encoder: %q", vaapi.Args)
 	}
@@ -252,7 +256,10 @@ func TestFFmpegHardwareEncoderArguments(t *testing.T) {
 		t.Errorf("VA-API sandbox command lacks GPU device permission: %q", vaapi.Args)
 	}
 
-	software := server.ffmpegCmd(cgroup{}, job, requested, "output.mp4", videoEncoder{mode: "software", name: "libx265"})
+	software, err := server.ffmpegCmd(cgroup{}, job, requested, "output.mp4", videoEncoder{mode: "software", name: "libx265"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !slices.Contains(software.Args, "libx265") || !slices.Contains(software.Args, "-crf") {
 		t.Errorf("software command = %q, want libx265 and -crf", software.Args)
 	}
