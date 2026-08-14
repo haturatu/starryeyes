@@ -1179,33 +1179,42 @@ func normalize(r Request, c Config) (Output, error) {
 	if !compatible(o) {
 		return o, errors.New("incompatible container/codec combination")
 	}
-	if o.Video.Encoder != "auto" && o.Video.Encoder != "software" && o.Video.Encoder != "vaapi" && o.Video.Encoder != "nvenc" {
-		return o, errors.New("unsupported video encoder")
-	}
-	if o.Video.Encoder == "nvenc" {
+	switch o.Video.Encoder {
+	case "auto", "software", "vaapi":
+		// These encoders are valid for every supported video codec.
+	case "nvenc":
 		if _, ok := nvencEncoder(o.Video.Codec); !ok {
 			return o, fmt.Errorf("%w: NVENC does not support %s", errUnsupportedEncoderCodec, o.Video.Codec)
 		}
+	default:
+		return o, errors.New("unsupported video encoder")
 	}
 	if o.Audio.BitrateKbps < 16 || o.Audio.BitrateKbps > 512 {
 		return o, errors.New("audio bitrate out of range")
 	}
-	if o.Video.Quality.Mode != "quality" && o.Video.Quality.Mode != "crf" {
+	switch o.Video.Quality.Mode {
+	case "quality":
+		if o.Video.Quality.Value < 0 || o.Video.Quality.Value > 100 {
+			return o, errors.New("quality out of range")
+		}
+	case "crf":
+		minCRF, maxCRF := crfRange(o.Video.Codec)
+		if o.Video.Quality.CRF < minCRF || o.Video.Quality.CRF > maxCRF {
+			return o, errors.New("CRF out of range")
+		}
+	default:
 		return o, errors.New("unsupported quality mode")
 	}
-	if o.Video.Quality.Mode == "quality" && (o.Video.Quality.Value < 0 || o.Video.Quality.Value > 100) {
-		return o, errors.New("quality out of range")
-	}
-	min, max := crfRange(o.Video.Codec)
-	if o.Video.Quality.Mode == "crf" && (o.Video.Quality.CRF < min || o.Video.Quality.CRF > max) {
-		return o, errors.New("CRF out of range")
-	}
 	resol := o.Video.Resolution
-	if resol.Mode != "source" && resol.Mode != "fit" {
+	switch resol.Mode {
+	case "source":
+		// The source resolution does not need dimensions.
+	case "fit":
+		if resol.Width < 2 || resol.Height < 2 || resol.Width > c.MaxWidth || resol.Height > c.MaxHeight {
+			return o, errors.New("resolution out of range")
+		}
+	default:
 		return o, errors.New("unsupported resolution mode")
-	}
-	if resol.Mode == "fit" && (resol.Width < 2 || resol.Height < 2 || resol.Width > c.MaxWidth || resol.Height > c.MaxHeight) {
-		return o, errors.New("resolution out of range")
 	}
 	return o, nil
 }
@@ -1223,9 +1232,10 @@ func merge(b, x Output) Output {
 		b.Video.Quality.Mode = x.Video.Quality.Mode
 		// Zero is valid for both public quality and CRF, so the selected
 		// mode makes the corresponding scalar an explicit override.
-		if x.Video.Quality.Mode == "quality" {
+		switch x.Video.Quality.Mode {
+		case "quality":
 			b.Video.Quality.Value = x.Video.Quality.Value
-		} else if x.Video.Quality.Mode == "crf" {
+		case "crf":
 			b.Video.Quality.CRF = x.Video.Quality.CRF
 		}
 	}
@@ -1265,11 +1275,15 @@ func scale(r Resolution) string {
 	}
 	return fmt.Sprintf("scale=%d:%d%s:force_divisible_by=2", r.Width, r.Height, up)
 }
-func crfRange(c string) (int, int) {
-	if c == "av1" || c == "vp9" {
+func crfRange(codec string) (int, int) {
+	switch codec {
+	case "av1", "vp9":
 		return 0, 63
+	case "h264", "hevc":
+		return 0, 51
+	default:
+		panic("unsupported video codec: " + codec)
 	}
-	return 0, 51
 }
 func crf(v Video) int {
 	if v.Quality.Mode == "crf" {
@@ -1278,26 +1292,31 @@ func crf(v Video) int {
 	_, max := crfRange(v.Codec)
 	return max - (v.Quality.Value * max / 100)
 }
-func softwareEncoder(c string) string {
-	if c == "h264" {
+func softwareEncoder(codec string) string {
+	switch codec {
+	case "h264":
 		return "libx264"
-	}
-	if c == "hevc" {
+	case "hevc":
 		return "libx265"
-	}
-	if c == "vp9" {
+	case "vp9":
 		return "libvpx-vp9"
+	case "av1":
+		return "libsvtav1"
+	default:
+		panic("unsupported video codec: " + codec)
 	}
-	return "libsvtav1"
 }
-func audio(c string) string {
-	if c == "opus" {
+func audio(codec string) string {
+	switch codec {
+	case "aac":
+		return "aac"
+	case "opus":
 		return "libopus"
-	}
-	if c == "flac" {
+	case "flac":
 		return "flac"
+	default:
+		panic("unsupported audio codec: " + codec)
 	}
-	return "aac"
 }
 func reservation(n int64, o Output) (int64, int64, int64) {
 	factor := int64(60)
