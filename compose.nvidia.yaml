@@ -2,6 +2,8 @@
 # Container Toolkit installed on the host for `gpus: all` to work.
 services:
   starryeyes:
+    build:
+      target: runtime-nvidia
     gpus: all
     environment:
       # Required by the NVIDIA Container Toolkit for FFmpeg's Video Codec SDK.
