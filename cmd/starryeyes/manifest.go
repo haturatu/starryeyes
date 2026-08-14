@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -142,7 +143,11 @@ func directorySyncUnsupported(err error) bool {
 	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EOPNOTSUPP)
 }
 
-func runBackfill(cfg Config) error {
+func runBackfill(cfg Config, loggers ...*slog.Logger) error {
+	logger := newLogger("text", slog.LevelInfo, io.Discard, io.Discard)
+	if len(loggers) > 0 && loggers[0] != nil {
+		logger = loggers[0]
+	}
 	for _, dir := range []string{cfg.Data, filepath.Join(cfg.Data, "spool"), cfg.Output} {
 		if err := os.MkdirAll(dir, 0750); err != nil {
 			return err
@@ -154,12 +159,12 @@ func runBackfill(cfg Config) error {
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	server := &Server{db: db, cfg: cfg, log: slog.Default(), sem: make(chan struct{}, cfg.Active)}
+	server := &Server{db: db, cfg: cfg, log: logger, sem: make(chan struct{}, cfg.Active)}
 	if err = server.schema(); err != nil {
 		return err
 	}
 	result, err := server.backfillOutputManifests()
-	server.log.Info("output manifest backfill complete", "found", result.Found, "imported", result.Imported, "updated", result.Updated, "existing", result.Existing, "conflicts", result.Conflicts, "invalid", result.Invalid)
+	server.component("storage").Info("output manifest backfill complete", "event", "manifest.backfill.completed", "found", result.Found, "imported", result.Imported, "updated", result.Updated, "existing", result.Existing, "conflicts", result.Conflicts, "invalid", result.Invalid)
 	return err
 }
 
@@ -178,7 +183,7 @@ func (s *Server) backfillOutputManifests() (backfillResult, error) {
 			continue
 		} else if err != nil {
 			result.Invalid++
-			s.log.Error("read output manifest", "path", manifestPath, "error", err)
+			s.component("storage").Error("read output manifest", "event", "manifest.read_failed", "path", manifestPath, "error", err)
 			continue
 		}
 		result.Found++
@@ -188,18 +193,18 @@ func (s *Server) backfillOutputManifests() (backfillResult, error) {
 		}
 		if err != nil {
 			result.Invalid++
-			s.log.Error("skip invalid output manifest", "path", manifestPath, "error", err)
+			s.component("storage").Error("skip invalid output manifest", "event", "manifest.invalid", "path", manifestPath, "error", err)
 			continue
 		}
 		status, err := s.importOutputManifest(manifest)
 		if err != nil {
 			if errors.Is(err, errCompletedManifestConflict) {
 				result.Conflicts++
-				s.log.Error("completed job conflicts with output manifest", "path", manifestPath, "error", err)
+				s.component("storage").Error("completed job conflicts with output manifest", "event", "manifest.conflict", "job_id", manifest.JobID, "path", manifestPath, "error", err)
 				continue
 			}
 			result.Invalid++
-			s.log.Error("import output manifest", "path", manifestPath, "error", err)
+			s.component("storage").Error("import output manifest", "event", "manifest.import_failed", "path", manifestPath, "error", err)
 			continue
 		}
 		switch status {
