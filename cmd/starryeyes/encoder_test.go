@@ -77,6 +77,129 @@ func TestNVENCCodecSupport(t *testing.T) {
 	}
 }
 
+func TestSoftwareEncoderMapping(t *testing.T) {
+	for codec, want := range map[string]string{
+		"h264": "libx264",
+		"hevc": "libx265",
+		"vp9":  "libvpx-vp9",
+		"av1":  "libsvtav1",
+	} {
+		if got := softwareEncoder(codec); got != want {
+			t.Errorf("softwareEncoder(%q) = %q, want %q", codec, got, want)
+		}
+	}
+}
+
+func TestAudioEncoderMapping(t *testing.T) {
+	for codec, want := range map[string]string{
+		"aac":  "aac",
+		"opus": "libopus",
+		"flac": "flac",
+	} {
+		if got := audio(codec); got != want {
+			t.Errorf("audio(%q) = %q, want %q", codec, got, want)
+		}
+	}
+}
+
+func TestNormalizeQualityAndResolutionModes(t *testing.T) {
+	config := Config{Capacity: 8 << 20, MaxWidth: 1920, MaxHeight: 1080}
+	base := Request{Input: Input{Filename: "clip.mp4", Size: 1 << 20}}
+
+	tests := []struct {
+		name    string
+		request Request
+		wantErr bool
+	}{
+		{
+			name: "quality lower bound",
+			request: func() Request {
+				r := base
+				r.Output.Video.Quality = Quality{Mode: "quality", Value: 0}
+				return r
+			}(),
+		},
+		{
+			name: "quality upper bound",
+			request: func() Request {
+				r := base
+				r.Output.Video.Quality = Quality{Mode: "quality", Value: 100}
+				return r
+			}(),
+		},
+		{
+			name: "quality out of range",
+			request: func() Request {
+				r := base
+				r.Output.Video.Quality = Quality{Mode: "quality", Value: 101}
+				return r
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "crf upper bound for h264",
+			request: func() Request {
+				r := base
+				r.Output.Video.Quality = Quality{Mode: "crf", CRF: 51}
+				return r
+			}(),
+		},
+		{
+			name: "crf out of range for h264",
+			request: func() Request {
+				r := base
+				r.Output.Video.Quality = Quality{Mode: "crf", CRF: 52}
+				return r
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "unsupported quality mode",
+			request: func() Request {
+				r := base
+				r.Output.Video.Quality = Quality{Mode: "bitrate"}
+				return r
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "fit resolution",
+			request: func() Request {
+				r := base
+				r.Output.Video.Resolution = Resolution{Mode: "fit", Width: 1920, Height: 1080}
+				return r
+			}(),
+		},
+		{
+			name: "resolution out of range",
+			request: func() Request {
+				r := base
+				r.Output.Video.Resolution = Resolution{Mode: "fit", Width: 1, Height: 1080}
+				return r
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "unsupported resolution mode",
+			request: func() Request {
+				r := base
+				r.Output.Video.Resolution = Resolution{Mode: "crop"}
+				return r
+			}(),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := normalize(tt.request, config)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("normalize() error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestAutoEncoderIncludesSoftwareFallback(t *testing.T) {
 	encoders, err := (&Server{}).videoEncoders(Video{Codec: "hevc", Encoder: "auto"})
 	if err != nil {
