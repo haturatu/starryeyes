@@ -1028,10 +1028,18 @@ type videoEncoder struct {
 	hardware   bool
 }
 
-var errUnsupportedEncoderCodec = errors.New("unsupported video encoder for codec")
+var (
+	errUnsupportedVideoCodec   = errors.New("unsupported video codec")
+	errUnsupportedAudioCodec   = errors.New("unsupported audio codec")
+	errUnsupportedEncoderCodec = errors.New("unsupported video encoder for codec")
+)
 
 func (s *Server) videoEncoders(video Video) ([]videoEncoder, error) {
-	software := videoEncoder{mode: "software", name: softwareEncoder(video.Codec)}
+	softwareName, err := softwareEncoder(video.Codec)
+	if err != nil {
+		return nil, err
+	}
+	software := videoEncoder{mode: "software", name: softwareName}
 	switch video.Encoder {
 	case "software":
 		return []videoEncoder{software}, nil
@@ -1292,18 +1300,18 @@ func crf(v Video) int {
 	_, max := crfRange(v.Codec)
 	return max - (v.Quality.Value * max / 100)
 }
-func softwareEncoder(codec string) string {
+func softwareEncoder(codec string) (string, error) {
 	switch codec {
 	case "h264":
-		return "libx264"
+		return "libx264", nil
 	case "hevc":
-		return "libx265"
+		return "libx265", nil
 	case "vp9":
-		return "libvpx-vp9"
+		return "libvpx-vp9", nil
 	case "av1":
-		return "libsvtav1"
+		return "libsvtav1", nil
 	default:
-		panic("unsupported video codec: " + codec)
+		return "", fmt.Errorf("%w: %s", errUnsupportedVideoCodec, codec)
 	}
 }
 func audio(codec string) string {

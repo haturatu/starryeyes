@@ -84,8 +84,9 @@ func TestSoftwareEncoderMapping(t *testing.T) {
 		"vp9":  "libvpx-vp9",
 		"av1":  "libsvtav1",
 	} {
-		if got := softwareEncoder(codec); got != want {
-			t.Errorf("softwareEncoder(%q) = %q, want %q", codec, got, want)
+		got, err := softwareEncoder(codec)
+		if err != nil || got != want {
+			t.Errorf("softwareEncoder(%q) = %q, %v; want %q, nil", codec, got, err, want)
 		}
 	}
 }
