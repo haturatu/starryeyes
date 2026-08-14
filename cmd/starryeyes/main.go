@@ -483,13 +483,13 @@ func (s *Server) probeAndQueue(jid, in string) {
 	cmd.Stderr = &stderr
 	b, e := cmd.Output()
 	if e != nil {
-		probeLog.Error("probe failed", "event", "probe.failed", "exit_code", commandExitCode(e), "stderr", stderr.String(), "error", e)
+		probeLog.Error("probe failed", "event", "probe.failed", "exit_code", commandExitCode(e), "stderr", stderr.String(), "stderr_truncated", stderr.truncated, "error", e)
 		s.fail(jid, fmt.Errorf("ffprobe: %w: %s", e, stderr.String()))
 		return
 	}
 	var p Probe
 	if e = json.Unmarshal(b, &p); e != nil {
-		probeLog.Error("probe output invalid", "event", "probe.failed", "stderr", stderr.String(), "error", e)
+		probeLog.Error("probe output invalid", "event", "probe.failed", "stderr", stderr.String(), "stderr_truncated", stderr.truncated, "error", e)
 		s.fail(jid, e)
 		return
 	}
@@ -948,6 +948,7 @@ func (s *Server) run(jid string) {
 	var lastEncoder videoEncoder
 	var lastExitCode int
 	var lastStderr string
+	var lastStderrTruncated bool
 	for index, selected := range encoders {
 		lastEncoder = selected
 		ffmpegLog := s.component("ffmpeg").With("job_id", jid, "encoder", selected.name, "encoder_type", selected.mode)
@@ -967,18 +968,19 @@ func (s *Server) run(jid string) {
 		}
 		lastExitCode = commandExitCode(e)
 		lastStderr = stderr.String()
+		lastStderrTruncated = stderr.truncated
 		transcodeErr = fmt.Errorf("%s: %w: %s", selected.name, e, truncate(stderr.String(), 1000))
 		if !selected.hardware || index+1 >= len(encoders) {
 			break
 		}
-		ffmpegLog.Warn("hardware encoder failed; trying fallback", "event", "encoder.fallback", "fallback_encoder", encoders[index+1].name, "exit_code", lastExitCode, "stderr", lastStderr, "error", transcodeErr)
+		ffmpegLog.Warn("hardware encoder failed; trying fallback", "event", "encoder.fallback", "fallback_encoder", encoders[index+1].name, "exit_code", lastExitCode, "stderr", lastStderr, "stderr_truncated", lastStderrTruncated, "error", transcodeErr)
 		if removeErr := os.Remove(filepath.Join(dir, artifact)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			s.fail(jid, fmt.Errorf("remove failed hardware output: %w", removeErr))
 			return
 		}
 	}
 	if transcodeErr != nil {
-		s.component("ffmpeg").With("job_id", jid, "encoder", lastEncoder.name, "encoder_type", lastEncoder.mode).Error("transcode failed", "event", "transcode.failed", "exit_code", lastExitCode, "stderr", lastStderr, "error", transcodeErr)
+		s.component("ffmpeg").With("job_id", jid, "encoder", lastEncoder.name, "encoder_type", lastEncoder.mode).Error("transcode failed", "event", "transcode.failed", "exit_code", lastExitCode, "stderr", lastStderr, "stderr_truncated", lastStderrTruncated, "error", transcodeErr)
 		s.fail(jid, fmt.Errorf("transcode: %w", transcodeErr))
 		return
 	}
