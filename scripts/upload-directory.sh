@@ -98,7 +98,7 @@ write_state() {
 		--argjson size "$size" \
 		--arg sha256 "$checksum" \
 		--arg preset "$OUTPUT_PRESET" \
-		'{version: 1, server: $server, job_id: (if $job_id == "" then null else $job_id end), idempotency_key: $idempotency_key, path: $path, filename: $filename, size: $size, sha256: $sha256, output: {preset: $preset}}' \
+		'{version: 1, server: $server, job_id: (if $job_id == "" then null else $job_id end), idempotency_key: $idempotency_key, path: $path, filename: $filename, size: $size, sha256: $sha256, output: {preset: $preset, video: {quality: {mode: "crf", crf: 18}}}}' \
 		>"$temporary"; then
 		rm -f -- "$temporary"
 		return 1
@@ -118,7 +118,7 @@ load_or_create_state() {
 		if ! jq --exit-status \
 			--arg server "$server_url" --arg path "$file" --arg filename "$filename" \
 			--argjson size "$size" --arg sha256 "$checksum" --arg preset "$OUTPUT_PRESET" \
-			'.version == 1 and .server == $server and .path == $path and .filename == $filename and .size == $size and .sha256 == $sha256 and .output.preset == $preset and (.idempotency_key | type == "string" and length >= 16)' \
+			'.version == 1 and .server == $server and .path == $path and .filename == $filename and .size == $size and .sha256 == $sha256 and .output.preset == $preset and .output.video.quality.mode == "crf" and .output.video.quality.crf == 18 and (.idempotency_key | type == "string" and length >= 16)' \
 			"$state_file" >/dev/null; then
 			printf 'invalid upload state %q; inspect or remove it before retrying\n' "$state_file" >&2
 			return 1
@@ -136,7 +136,7 @@ create_or_discover_job() {
 	idempotency_key=$(jq --exit-status --raw-output '.idempotency_key' "$state_file") || return 1
 	payload=$(jq --null-input --compact-output \
 		--arg filename "$filename" --argjson size "$size" --arg sha256 "$checksum" --arg preset "$OUTPUT_PRESET" \
-		'{input: {filename: $filename, size: $size, sha256: $sha256}, output: {preset: $preset}}') || return 1
+		'{input: {filename: $filename, size: $size, sha256: $sha256}, output: {preset: $preset, video: {quality: {mode: "crf", crf: 18}}}}') || return 1
 	response="$work_dir/create-response.json"
 	if ! code=$(request POST "$server_url/v1/jobs" "$payload" "$response" \
 		--header 'Content-Type: application/json' --header "Idempotency-Key: $idempotency_key"); then
@@ -298,8 +298,7 @@ resume_workflow() {
 				sleep "$JOB_POLL_SECONDS"
 				;;
 			COMPLETED)
-				rm -f -- "$state_file"
-				printf 'completed %q (job %s); upload state removed\n' "$file" "$job_id"
+				printf 'already completed %q (job %s); skipping upload\n' "$file" "$job_id"
 				return 0
 				;;
 			EXPIRED)
@@ -327,7 +326,7 @@ upload_file() (
 	filename=$(basename -- "$file")
 	size=$(stat --format='%s' -- "$file") || return 1
 	checksum=$(sha256sum -- "$file" | awk '{print $1}') || return 1
-	session_id=$(printf '%s\0%s\0%s\0%s\0%s' "$server_url" "$file" "$size" "$checksum" "$OUTPUT_PRESET" | sha256sum | awk '{print $1}') || return 1
+	session_id=$(printf '%s\0%s\0%s\0%s\0%s\0%s\0%s' "$server_url" "$file" "$size" "$checksum" "$OUTPUT_PRESET" crf 18 | sha256sum | awk '{print $1}') || return 1
 	state_file="$state_dir/$session_id.json"
 	exec {lock_fd}>"$state_file.lock" || return 1
 	flock "$lock_fd" || return 1
