@@ -73,6 +73,42 @@ func TestBoundedBuffer(t *testing.T) {
 	}
 }
 
+func TestValidRequestID(t *testing.T) {
+	for _, value := range []string{"abc123", "trace-123_foo.bar", strings.Repeat("a", 128)} {
+		if !validRequestID(value) {
+			t.Errorf("validRequestID(%q) = false, want true", value)
+		}
+	}
+	for _, value := range []string{"", "has space", "has/slash", "line\nbreak", strings.Repeat("a", 129)} {
+		if validRequestID(value) {
+			t.Errorf("validRequestID(%q) = true, want false", value)
+		}
+	}
+}
+
+func TestRequestLoggingReplacesInvalidRequestID(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	logger := newLogger("json", slog.LevelDebug, &stdout, &stderr)
+	handler := requestLogging(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/job-123", nil)
+	request.Header.Set("X-Request-ID", strings.Repeat("x", 129))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	got := recorder.Header().Get("X-Request-ID")
+	if got == "" || got == request.Header.Get("X-Request-ID") || !validRequestID(got) {
+		t.Fatalf("response request ID = %q, want generated valid request ID", got)
+	}
+	if !strings.Contains(stdout.String(), `"request_id":"`+got+`"`) {
+		t.Errorf("stdout = %q, want generated request ID", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty stderr", stderr.String())
+	}
+}
+
 func TestRequestLoggingAndInternalError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	logger := newLogger("json", slog.LevelDebug, &stdout, &stderr)
@@ -99,7 +135,13 @@ func TestRequestLoggingAndInternalError(t *testing.T) {
 	if !strings.Contains(stderr.String(), "database is locked") || !strings.Contains(stderr.String(), "job-123") {
 		t.Errorf("stderr = %q, want internal error and job ID", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), `"event":"http.error"`) || !strings.Contains(stderr.String(), `"event":"http.request"`) {
-		t.Errorf("stderr = %q, want structured HTTP events", stderr.String())
+	if !strings.Contains(stderr.String(), `"event":"http.error"`) {
+		t.Errorf("stderr = %q, want http.error event", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"http.request"`) {
+		t.Errorf("stderr = %q, http.request must not be an error record", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"event":"http.request"`) || !strings.Contains(stdout.String(), `"level":"INFO"`) {
+		t.Errorf("stdout = %q, want informational access log", stdout.String())
 	}
 }
