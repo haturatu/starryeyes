@@ -104,6 +104,62 @@ func TestAudioEncoderMapping(t *testing.T) {
 	}
 }
 
+func TestCodecHelpersRejectUnsupportedValues(t *testing.T) {
+	if got, err := softwareEncoder("mpeg2"); !errors.Is(err, errUnsupportedVideoCodec) || got != "" {
+		t.Errorf("softwareEncoder(mpeg2) = %q, %v; want empty unsupported video codec error", got, err)
+	}
+	if got, err := audioEncoder("mp3"); !errors.Is(err, errUnsupportedAudioCodec) || got != "" {
+		t.Errorf("audioEncoder(mp3) = %q, %v; want empty unsupported audio codec error", got, err)
+	}
+	if _, err := crf(Video{Codec: "mpeg2", Quality: Quality{Mode: "crf", CRF: 23}}); !errors.Is(err, errUnsupportedVideoCodec) {
+		t.Errorf("crf(mpeg2) error = %v, want unsupported video codec error", err)
+	}
+}
+
+func TestCRFRange(t *testing.T) {
+	for _, tt := range []struct {
+		codec string
+		min   int
+		max   int
+	}{
+		{codec: "av1", min: 0, max: 63},
+		{codec: "vp9", min: 0, max: 63},
+		{codec: "h264", min: 0, max: 51},
+		{codec: "hevc", min: 0, max: 51},
+	} {
+		t.Run(tt.codec, func(t *testing.T) {
+			min, max, err := crfRange(tt.codec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if min != tt.min || max != tt.max {
+				t.Errorf("crfRange(%q) = %d, %d; want %d, %d", tt.codec, min, max, tt.min, tt.max)
+			}
+		})
+	}
+	if _, _, err := crfRange("mpeg2"); !errors.Is(err, errUnsupportedVideoCodec) {
+		t.Errorf("crfRange(mpeg2) error = %v, want unsupported video codec error", err)
+	}
+}
+
+func TestFFmpegCommandRejectsUnsupportedAudio(t *testing.T) {
+	server := &Server{cfg: Config{Data: t.TempDir(), Output: t.TempDir()}}
+	_, err := server.ffmpegCmd(
+		cgroup{},
+		Job{ID: "job-123"},
+		Output{
+			Container: "mp4",
+			Video:     Video{Codec: "h264", Quality: Quality{Mode: "quality", Value: 72}},
+			Audio:     Audio{Codec: "mp3", BitrateKbps: 160},
+		},
+		"output.mp4",
+		videoEncoder{mode: "software", name: "libx264"},
+	)
+	if !errors.Is(err, errUnsupportedAudioCodec) {
+		t.Errorf("ffmpegCmd() error = %v, want unsupported audio codec error", err)
+	}
+}
+
 func TestNormalizeQualityAndResolutionModes(t *testing.T) {
 	config := Config{Capacity: 8 << 20, MaxWidth: 1920, MaxHeight: 1080}
 	base := Request{Input: Input{Filename: "clip.mp4", Size: 1 << 20}}
