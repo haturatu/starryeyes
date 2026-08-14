@@ -3,6 +3,8 @@
 # device boundary.
 services:
   starryeyes:
+    build:
+      target: runtime-vaapi
     devices:
       - ${VAAPI_DEVICE:-/dev/dri/renderD128}:${VAAPI_DEVICE:-/dev/dri/renderD128}
     group_add:

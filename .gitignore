@@ -7,3 +7,4 @@
 *.mkv
 *.webm
 .DS_Store
+nohup.out
