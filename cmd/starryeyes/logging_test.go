@@ -109,6 +109,22 @@ func TestRequestLoggingReplacesInvalidRequestID(t *testing.T) {
 	}
 }
 
+func TestRequestLoggingKeepsClientErrorsInformational(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	logger := newLogger("json", slog.LevelDebug, &stdout, &stderr)
+	handler := requestLogging(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/jobs", nil))
+
+	if !strings.Contains(stdout.String(), `"event":"http.request"`) || !strings.Contains(stdout.String(), `"status":422`) || !strings.Contains(stdout.String(), `"level":"INFO"`) {
+		t.Errorf("stdout = %q, want informational 422 access log", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want no warning/error access log", stderr.String())
+	}
+}
+
 func TestRequestLoggingAndInternalError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	logger := newLogger("json", slog.LevelDebug, &stdout, &stderr)
