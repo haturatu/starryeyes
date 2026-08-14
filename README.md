@@ -226,7 +226,14 @@ VAAPI_DEVICE=/dev/dri/renderD128 # VA-API render node; map it with compose.vaapi
 REQUIRE_LANDLOCK=true
 REQUIRE_CGROUP=true       # production; Compose sets false because it has no delegation
 CGROUP_ROOT=/sys/fs/cgroup/starryeyes.service
+LOG_LEVEL=info
+LOG_FORMAT=json
 ```
+
+The daemon writes structured JSON logs by default. `DEBUG` and `INFO` records
+go to stdout; `WARN` and `ERROR` records go to stderr. The JSON `level` field
+is the authoritative severity when both Docker streams are collected together.
+For local development, set `LOG_FORMAT=text` and `LOG_LEVEL=debug`.
 
 ## Validation
 

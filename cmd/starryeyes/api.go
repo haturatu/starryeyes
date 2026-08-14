@@ -40,5 +40,5 @@ func newRouter(s *Server) http.Handler {
 		GetJob:       s.get,
 		Output:       s.output,
 	})
-	return mux
+	return requestLogging(s.log, mux)
 }

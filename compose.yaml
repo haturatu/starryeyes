@@ -19,6 +19,8 @@ services:
       CGROUP_ROOT: ${CGROUP_ROOT:-}
       REQUIRE_CGROUP: ${REQUIRE_CGROUP:-false}
       REQUIRE_LANDLOCK: ${REQUIRE_LANDLOCK:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
     volumes:
       - type: bind
         source: ${DATA_DIR_HOST:-/var/lib/starryeyes}
@@ -31,4 +33,9 @@ services:
     cap_drop: ["ALL"]
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,size=256m"]
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
     restart: unless-stopped

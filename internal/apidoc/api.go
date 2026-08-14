@@ -11,7 +11,8 @@ import (
 )
 
 type APIError struct {
-	Error string `json:"error" doc:"Human-readable explanation of the failure."`
+	Error     string `json:"error" doc:"Human-readable explanation of the failure."`
+	RequestID string `json:"request_id,omitempty" doc:"Request identifier for correlating an internal server error with the server log."`
 }
 
 type APIHealthResponse struct {

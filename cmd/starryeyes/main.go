@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"golang.org/x/sys/unix"
 	"io"
-	stdlog "log"
 	"log/slog"
 	"mime"
 	_ "modernc.org/sqlite"
@@ -86,55 +85,69 @@ type Probe struct {
 }
 
 func main() {
+	logger, err := loggerFromEnv()
+	if err != nil {
+		logger = bootstrapLogger()
+		logger.Error("startup failed", "component", "startup", "event", "service.startup_failed", "error", err)
+		os.Exit(1)
+	}
+	if err := run(logger); err != nil {
+		logger.Error("startup failed", "component", "startup", "event", "service.startup_failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger) error {
 	backfill := len(os.Args) == 2 && os.Args[1] == "backfill"
 	if len(os.Args) > 1 && !backfill {
-		stdlog.Fatalf("usage: %s [backfill]", os.Args[0])
+		return fmt.Errorf("usage: %s [backfill]", os.Args[0])
 	}
 	c, e := configFromEnv()
 	if e != nil {
-		stdlog.Fatal(e)
+		return e
 	}
 	if backfill {
-		if e := runBackfill(c); e != nil {
-			stdlog.Fatal(e)
-		}
-		return
+		return runBackfill(c, logger)
 	}
 	if c.Chunk < 1<<20 || c.Active < 1 {
-		stdlog.Fatal("invalid config")
+		return errors.New("invalid config")
 	}
 	if c.RequireLandlock {
 		for _, p := range []string{"/usr/local/bin/sandbox-exec", "/usr/local/bin/cgroup-exec"} {
 			if _, e := exec.LookPath(p); e != nil {
-				stdlog.Fatalf("required Landlock component %s: %v", p, e)
+				return fmt.Errorf("required Landlock component %s: %w", p, e)
 			}
 		}
 		if e := exec.Command("/usr/local/bin/sandbox-exec", "--check").Run(); e != nil {
-			stdlog.Fatalf("Landlock ABI >=4 is required: %v", e)
+			return fmt.Errorf("Landlock ABI >=4 is required: %w", e)
 		}
 	}
 	for _, d := range []string{c.Data, filepath.Join(c.Data, "spool"), c.Output} {
 		if e := os.MkdirAll(d, 0750); e != nil {
-			stdlog.Fatal(e)
+			return e
 		}
 	}
 	db, e := sql.Open("sqlite", filepath.Join(c.Data, "jobs.sqlite?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)"))
 	if e != nil {
-		stdlog.Fatal(e)
+		return e
 	}
+	defer db.Close()
 	db.SetMaxOpenConns(1)
-	s := &Server{db: db, cfg: c, log: slog.Default(), sem: make(chan struct{}, c.Active)}
+	s := &Server{db: db, cfg: c, log: logger, sem: make(chan struct{}, c.Active)}
 	if e = s.schema(); e != nil {
-		stdlog.Fatal(e)
+		return e
 	}
 	if e = s.recover(); e != nil {
-		stdlog.Fatal(e)
+		return e
 	}
 	go s.runUploadGC()
 	h := http.MaxBytesHandler(newRouter(s), c.Chunk+8192)
 	srv := &http.Server{Addr: c.Listen, Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second}
-	s.log.Info("listening", "address", c.Listen)
-	stdlog.Fatal(srv.ListenAndServe())
+	s.component("startup").Info("service listening", "event", "service.started", "address", c.Listen)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 func (s *Server) schema() error {
 	_, e := s.db.Exec(`CREATE TABLE IF NOT EXISTS capacity(id INTEGER PRIMARY KEY CHECK(id=1), total INTEGER NOT NULL,reserved INTEGER NOT NULL DEFAULT 0); INSERT OR IGNORE INTO capacity(id,total,reserved) VALUES(1,0,0); UPDATE capacity SET total=? WHERE id=1 AND reserved=0; CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,client_request_id TEXT UNIQUE,request_hash TEXT,state TEXT NOT NULL,filename TEXT NOT NULL,size INTEGER NOT NULL,received INTEGER NOT NULL DEFAULT 0,chunks INTEGER NOT NULL DEFAULT 0,expected INTEGER NOT NULL,chunk_size INTEGER NOT NULL,spec TEXT NOT NULL,input_hash TEXT,actual_hash TEXT,reserved INTEGER NOT NULL,error TEXT,artifact TEXT,probe_json TEXT,created_at TEXT NOT NULL,last_activity_at TEXT,expires_at TEXT,started_at TEXT,finished_at TEXT); CREATE TABLE IF NOT EXISTS reservations(job_id TEXT PRIMARY KEY,input_bytes INTEGER NOT NULL,output_bytes INTEGER NOT NULL,safety_bytes INTEGER NOT NULL,total INTEGER NOT NULL,FOREIGN KEY(job_id) REFERENCES jobs(id)); CREATE TABLE IF NOT EXISTS chunks(job_id TEXT NOT NULL,number INTEGER NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job_id,number),FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state); CREATE INDEX IF NOT EXISTS jobs_upload_expiry ON jobs(expires_at) WHERE state IN ('PENDING','ADMITTED','UPLOADING');`, s.cfg.Capacity)
@@ -189,7 +202,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	expiresAt := uploadExpiry(now, s.cfg.UploadRetention)
 	tx, e := s.db.Begin()
 	if e != nil {
-		bad(w, 500, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	defer tx.Rollback()
@@ -207,14 +220,15 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 			e = tx.Commit()
 		}
 		if e != nil {
-			bad(w, http.StatusInternalServerError, e.Error())
+			internalError(w, r, http.StatusInternalServerError, e)
 			return
 		}
+		s.component("admission").Debug("idempotent job replay", "event", "job.replayed", "job_id", existing.ID)
 		out(w, http.StatusCreated, s.createJobResponse(existing))
 		return
 	}
 	if e != sql.ErrNoRows {
-		bad(w, http.StatusInternalServerError, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	jobID := id()
@@ -224,9 +238,10 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		e = tx.Commit()
 	}
 	if e != nil {
-		bad(w, 500, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
+	s.component("admission").Info("job created", "event", "job.created", "job_id", jobID, "size_bytes", q.Input.Size)
 	go s.admitPending()
 	out(w, http.StatusCreated, APICreateJobResponse{
 		ID:               jobID,
@@ -243,12 +258,12 @@ func (s *Server) listChunks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if e != nil {
-		bad(w, http.StatusInternalServerError, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	rows, e := s.db.Query(`SELECT number,bytes,sha256 FROM chunks WHERE job_id=? AND state='VERIFIED' ORDER BY number`, j.ID)
 	if e != nil {
-		bad(w, http.StatusInternalServerError, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	defer rows.Close()
@@ -256,13 +271,13 @@ func (s *Server) listChunks(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var chunk APIVerifiedChunk
 		if e = rows.Scan(&chunk.Number, &chunk.Size, &chunk.SHA256); e != nil {
-			bad(w, http.StatusInternalServerError, e.Error())
+			internalError(w, r, http.StatusInternalServerError, e)
 			return
 		}
 		chunks = append(chunks, chunk)
 	}
 	if e = rows.Err(); e != nil {
-		bad(w, http.StatusInternalServerError, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	out(w, http.StatusOK, APIChunksResponse{ChunkSize: j.ChunkSize, Expected: j.Expected, Chunks: chunks})
@@ -281,8 +296,12 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 	chunk.Lock()
 	defer chunk.Unlock()
 	j, e := s.job(jid)
-	if e != nil {
+	if e == sql.ErrNoRows {
 		bad(w, 404, "job not found")
+		return
+	}
+	if e != nil {
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	if n >= j.Expected {
@@ -301,9 +320,10 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		if have == sum {
 			now := time.Now().UTC()
 			if _, updateErr := s.db.Exec(`UPDATE jobs SET last_activity_at=?,expires_at=? WHERE id=? AND state IN (?,?)`, now.Format(time.RFC3339Nano), uploadExpiry(now, s.cfg.UploadRetention), jid, admitted, uploading); updateErr != nil {
-				bad(w, http.StatusInternalServerError, updateErr.Error())
+				internalError(w, r, http.StatusInternalServerError, updateErr)
 				return
 			}
+			s.component("upload").Debug("chunk already verified", "event", "upload.chunk.already_present", "job_id", jid, "chunk", n)
 			out(w, http.StatusOK, APIChunkResponse{Chunk: n, Status: "already_present"})
 			return
 		}
@@ -311,7 +331,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if e != sql.ErrNoRows {
-		bad(w, 500, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	if j.State != admitted && j.State != uploading {
@@ -332,7 +352,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		z, er := r.Body.Read(buf)
 		if z > 0 {
 			if _, x := unix.Pwrite(int(f.Fd()), buf[:z], off+got); x != nil {
-				bad(w, 507, x.Error())
+				internalError(w, r, http.StatusInsufficientStorage, x)
 				return
 			}
 			h.Write(buf[:z])
@@ -351,12 +371,12 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if e = unix.Fdatasync(int(f.Fd())); e != nil {
-		bad(w, 500, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	tx, e := s.db.Begin()
 	if e != nil {
-		bad(w, 500, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	defer tx.Rollback()
@@ -378,9 +398,10 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request) {
 		e = tx.Commit()
 	}
 	if e != nil {
-		bad(w, 500, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
+	s.component("upload").Debug("chunk accepted", "event", "upload.chunk.accepted", "job_id", jid, "chunk", n, "bytes", want)
 	out(w, http.StatusOK, APIChunkResponse{Chunk: n, Bytes: want, Status: "verified"})
 }
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
@@ -390,7 +411,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 	tx, e := s.db.Begin()
 	if e != nil {
-		bad(w, 500, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	x, e := tx.Exec(`UPDATE jobs SET state=?,last_activity_at=?,expires_at=NULL WHERE id=? AND state IN (?,?) AND received=size AND chunks=expected`, finalizing, time.Now().UTC().Format(time.RFC3339Nano), jid, admitted, uploading)
@@ -400,7 +421,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		tx.Rollback()
 	}
 	if e != nil {
-		bad(w, 500, e.Error())
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	n, _ := x.RowsAffected()
@@ -414,6 +435,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go s.finalize(jid)
+	s.component("upload").Info("upload completed", "event", "upload.completed", "job_id", jid)
 	out(w, http.StatusAccepted, APIJobStateResponse{ID: jid, State: finalizing})
 }
 func (s *Server) finalize(jid string) {
@@ -444,31 +466,49 @@ func (s *Server) finalize(jid string) {
 		s.fail(jid, e)
 		return
 	}
+	s.component("upload").Info("upload finalized", "event", "upload.finalized", "job_id", jid)
 	s.probeAndQueue(jid, in)
 }
 func (s *Server) probeAndQueue(jid, in string) {
 	if _, e := s.db.Exec(`UPDATE jobs SET state=? WHERE id=? AND state=?`, probing, jid, staged); e != nil {
+		s.component("db").Error("update job state", "event", "job.state_update_failed", "job_id", jid, "state", probing, "error", e)
 		return
 	}
-	b, e := s.probeCmd(in).Output()
+	probeLog := s.component("ffprobe").With("job_id", jid)
+	probeLog.Info("probe started", "event", "probe.started")
+	started := time.Now()
+	var stderr boundedBuffer
+	stderr.limit = maxCapturedProcessStderr
+	cmd := s.probeCmd(in)
+	cmd.Stderr = &stderr
+	b, e := cmd.Output()
 	if e != nil {
-		s.fail(jid, fmt.Errorf("ffprobe: %w", e))
+		probeLog.Error("probe failed", "event", "probe.failed", "exit_code", commandExitCode(e), "stderr", stderr.String(), "stderr_truncated", stderr.truncated, "error", e)
+		s.fail(jid, fmt.Errorf("ffprobe: %w: %s", e, stderr.String()))
 		return
 	}
 	var p Probe
 	if e = json.Unmarshal(b, &p); e != nil {
+		probeLog.Error("probe output invalid", "event", "probe.failed", "stderr", stderr.String(), "stderr_truncated", stderr.truncated, "error", e)
 		s.fail(jid, e)
 		return
 	}
 	if e = s.validateProbe(p); e != nil {
+		probeLog.Warn("probe validation failed", "event", "probe.rejected", "error", e)
 		s.fail(jid, e)
 		return
 	}
+	probeLog.Info("probe completed", "event", "probe.completed", "duration_ms", time.Since(started).Milliseconds(), "stream_count", len(p.Streams))
 	pb, _ := json.Marshal(p)
 	if _, e = s.db.Exec(`UPDATE jobs SET state=?,probe_json=? WHERE id=? AND state=?`, validated, string(pb), jid, probing); e != nil {
+		s.component("db").Error("store probe result", "event", "probe.persist_failed", "job_id", jid, "error", e)
 		return
 	}
-	s.db.Exec(`UPDATE jobs SET state=? WHERE id=? AND state=?`, queued, jid, validated)
+	if _, e = s.db.Exec(`UPDATE jobs SET state=? WHERE id=? AND state=?`, queued, jid, validated); e != nil {
+		s.component("db").Error("queue job", "event", "job.queue_failed", "job_id", jid, "error", e)
+		return
+	}
+	s.component("scheduler").Info("job queued", "event", "job.queued", "job_id", jid)
 	s.schedule()
 }
 func (s *Server) validateProbe(p Probe) error {
@@ -488,8 +528,12 @@ func (s *Server) validateProbe(p Probe) error {
 }
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	j, e := s.job(r.PathValue("id"))
-	if e != nil {
+	if e == sql.ErrNoRows {
 		bad(w, 404, "job not found")
+		return
+	}
+	if e != nil {
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	out(w, http.StatusOK, APIJobResponse{
@@ -510,13 +554,17 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 	j, e := s.job(r.PathValue("id"))
-	if e != nil || j.State != completed || !j.Artifact.Valid {
+	if e == sql.ErrNoRows || (e == nil && (j.State != completed || !j.Artifact.Valid)) {
 		bad(w, 404, "output not available")
+		return
+	}
+	if e != nil {
+		internalError(w, r, http.StatusInternalServerError, e)
 		return
 	}
 	name := filepath.Base(j.Artifact.String)
 	if name != j.Artifact.String {
-		bad(w, 500, "invalid artifact key")
+		internalError(w, r, http.StatusInternalServerError, errors.New("invalid artifact key"))
 		return
 	}
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{
@@ -538,7 +586,7 @@ func (s *Server) admitPending() {
 			return
 		}
 		if e != nil {
-			s.log.Error("find pending job", "error", e)
+			s.component("admission").Error("find pending job", "event", "admission.scan_failed", "error", e)
 			return
 		}
 		if j.Reserved == 0 {
@@ -564,7 +612,7 @@ func (s *Server) admitPending() {
 		if changed, _ := result.RowsAffected(); changed != 1 {
 			continue
 		}
-		s.log.Info("job admitted for upload", "id", j.ID, "reserved_bytes", j.Reserved)
+		s.component("admission").Info("job admitted for upload", "event", "job.admitted", "job_id", j.ID, "reserved_bytes", j.Reserved)
 	}
 }
 
@@ -685,7 +733,7 @@ func (s *Server) runUploadGC() {
 	defer ticker.Stop()
 	for now := range ticker.C {
 		if e := s.expireUploads(now.UTC()); e != nil {
-			s.log.Error("expire abandoned uploads", "error", e)
+			s.component("gc").Error("expire abandoned uploads", "event", "gc.expire_failed", "error", e)
 		}
 	}
 }
@@ -760,9 +808,9 @@ func (s *Server) expireUpload(jobID string, now time.Time) error {
 		return e
 	}
 	if e = os.RemoveAll(s.dir(jobID)); e != nil {
-		s.log.Error("remove expired upload spool", "id", jobID, "error", e)
+		s.component("storage").Error("remove expired upload spool", "event", "storage.cleanup_failed", "job_id", jobID, "error", e)
 	}
-	s.log.Info("upload expired", "id", jobID)
+	s.component("gc").Info("upload expired", "event", "upload.expired", "job_id", jobID)
 	return nil
 }
 
@@ -835,14 +883,15 @@ func (s *Server) failUpload(jobID string, cause error) error {
 		return e
 	}
 	if e = os.RemoveAll(s.dir(jobID)); e != nil {
-		s.log.Error("remove invalid resumable upload spool", "id", jobID, "error", e)
+		s.component("storage").Error("remove invalid resumable upload spool", "event", "storage.cleanup_failed", "job_id", jobID, "error", e)
 	}
-	s.log.Error("resumable upload failed integrity check", "id", jobID, "error", cause)
+	s.component("upload").Error("resumable upload failed integrity check", "event", "upload.integrity_failed", "job_id", jobID, "error", cause)
 	return nil
 }
 func (s *Server) schedule() {
 	s.scheduleMu.Lock()
 	defer s.scheduleMu.Unlock()
+	s.component("scheduler").Debug("scheduler scan", "event", "scheduler.scan", "active", len(s.sem), "capacity", cap(s.sem))
 	for len(s.sem) < cap(s.sem) {
 		var jid string
 		if e := s.db.QueryRow(`SELECT id FROM jobs WHERE state=? ORDER BY created_at LIMIT 1`, queued).Scan(&jid); e != nil {
@@ -863,6 +912,7 @@ func (s *Server) schedule() {
 func (s *Server) run(jid string) {
 	j, e := s.job(jid)
 	if e != nil {
+		s.component("db").Error("load queued job", "event", "job.load_failed", "job_id", jid, "error", e)
 		return
 	}
 	cg, e := s.makeCgroup(jid)
@@ -872,8 +922,12 @@ func (s *Server) run(jid string) {
 	}
 	defer cg.cleanup()
 	if _, e = s.db.Exec(`UPDATE jobs SET state=? WHERE id=?`, transcoding, jid); e != nil {
+		s.component("db").Error("update job state", "event", "job.state_update_failed", "job_id", jid, "state", transcoding, "error", e)
 		return
 	}
+	workerLog := s.component("worker").With("job_id", jid)
+	workerLog.Info("transcode started", "event", "transcode.started")
+	started := time.Now()
 	var o Output
 	if e = json.Unmarshal([]byte(j.Spec), &o); e != nil {
 		s.fail(jid, e)
@@ -891,30 +945,42 @@ func (s *Server) run(jid string) {
 		return
 	}
 	var transcodeErr error
-	for _, selected := range encoders {
+	var lastEncoder videoEncoder
+	var lastExitCode int
+	var lastStderr string
+	var lastStderrTruncated bool
+	for index, selected := range encoders {
+		lastEncoder = selected
+		ffmpegLog := s.component("ffmpeg").With("job_id", jid, "encoder", selected.name, "encoder_type", selected.mode)
+		ffmpegLog.Info("encoder selected", "event", "encoder.selected")
 		cmd, e := s.ffmpegCmd(cg, j, o, artifact, selected)
 		if e != nil {
 			s.fail(jid, fmt.Errorf("build ffmpeg command: %w", e))
 			return
 		}
-		var stderr strings.Builder
+		var stderr boundedBuffer
+		stderr.limit = maxCapturedProcessStderr
 		cmd.Stderr = &stderr
 		e = cmd.Run()
 		if e == nil {
 			transcodeErr = nil
 			break
 		}
+		lastExitCode = commandExitCode(e)
+		lastStderr = stderr.String()
+		lastStderrTruncated = stderr.truncated
 		transcodeErr = fmt.Errorf("%s: %w: %s", selected.name, e, truncate(stderr.String(), 1000))
-		if !selected.hardware {
+		if !selected.hardware || index+1 >= len(encoders) {
 			break
 		}
-		s.log.Warn("hardware video encoder failed; trying next auto fallback", "id", jid, "encoder", selected.name, "error", transcodeErr)
+		ffmpegLog.Warn("hardware encoder failed; trying fallback", "event", "encoder.fallback", "fallback_encoder", encoders[index+1].name, "exit_code", lastExitCode, "stderr", lastStderr, "stderr_truncated", lastStderrTruncated, "error", transcodeErr)
 		if removeErr := os.Remove(filepath.Join(dir, artifact)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			s.fail(jid, fmt.Errorf("remove failed hardware output: %w", removeErr))
 			return
 		}
 	}
 	if transcodeErr != nil {
+		s.component("ffmpeg").With("job_id", jid, "encoder", lastEncoder.name, "encoder_type", lastEncoder.mode).Error("transcode failed", "event", "transcode.failed", "exit_code", lastExitCode, "stderr", lastStderr, "stderr_truncated", lastStderrTruncated, "error", transcodeErr)
 		s.fail(jid, fmt.Errorf("transcode: %w", transcodeErr))
 		return
 	}
@@ -928,7 +994,8 @@ func (s *Server) run(jid string) {
 		return
 	}
 	s.release(j)
-	s.log.Info("job completed", "id", jid)
+	workerLog.Info("transcode completed", "event", "transcode.completed", "encoder", lastEncoder.name, "duration_ms", time.Since(started).Milliseconds())
+	workerLog.Info("job completed", "event", "job.completed", "encoder", lastEncoder.name, "duration_ms", time.Since(started).Milliseconds())
 }
 func (s *Server) fail(jid string, e error) {
 	j, x := s.job(jid)
@@ -936,7 +1003,7 @@ func (s *Server) fail(jid string, e error) {
 		s.release(j)
 	}
 	s.db.Exec(`UPDATE jobs SET state=?,error=?,finished_at=? WHERE id=? AND state NOT IN (?,?)`, failed, e.Error(), time.Now().UTC(), jid, completed, failed)
-	s.log.Error("job failed", "id", jid, "error", e)
+	s.component("worker").Error("job failed", "event", "job.failed", "job_id", jid, "error", e)
 }
 func (s *Server) release(j Job) {
 	if j.Reserved > 0 {
