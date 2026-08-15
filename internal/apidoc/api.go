@@ -95,7 +95,7 @@ type Input struct {
 }
 type Request struct {
 	Input  Input  `json:"input" doc:"Input file metadata."`
-	Output Output `json:"output,omitempty" doc:"Optional output selection. Defaults to MP4, H.264, AAC, and source resolution."`
+	Output Output `json:"output,omitempty" doc:"Optional output selection. Defaults to MP4, H.264, AAC, and automatic compression with a 720p-class maximum resolution."`
 }
 type Output struct {
 	Preset    string `json:"preset,omitempty" enum:"web-1080p,archive-av1" doc:"Optional preset. Explicit output fields override the preset defaults."`
@@ -122,7 +122,7 @@ type Resolution struct {
 }
 type Audio struct {
 	Codec       string `json:"codec,omitempty" enum:"aac,opus,flac" doc:"Audio codec. Defaults to aac."`
-	BitrateKbps int    `json:"bitrate_kbps,omitempty" minimum:"16" maximum:"512" doc:"Audio bitrate in kbps. Defaults to 160."`
+	BitrateKbps int    `json:"bitrate_kbps,omitempty" minimum:"16" maximum:"512" doc:"Audio bitrate in kbps. Automatic compression defaults to 128; explicit presets may choose another value."`
 }
 
 // Handlers is the runtime implementation for the documented operations.
