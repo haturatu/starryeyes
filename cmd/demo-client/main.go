@@ -50,7 +50,7 @@ func main() {
 	if _, e = f.Seek(0, io.SeekStart); e != nil {
 		panic(e)
 	}
-	body, _ := json.Marshal(map[string]any{"input": map[string]any{"filename": filepath.Base(*file), "size": st.Size(), "sha256": hex.EncodeToString(whole.Sum(nil))}, "output": map[string]any{"preset": "web-1080p"}})
+	body, _ := json.Marshal(map[string]any{"input": map[string]any{"filename": filepath.Base(*file), "size": st.Size(), "sha256": hex.EncodeToString(whole.Sum(nil))}})
 	request, e := http.NewRequest(http.MethodPost, *base+"/v1/jobs", bytes.NewReader(body))
 	if e != nil {
 		panic(e)

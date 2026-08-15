@@ -4,6 +4,20 @@
 
 The public API accepts a validated, high-level output specification. It never accepts arbitrary FFmpeg arguments or shell commands.
 
+## Automatic compression
+
+When `output` is omitted, Starryeyes uses an automatic compression plan. It estimates the input's total bitrate from the uploaded byte size and the probed duration, then targets `min(input bitrate * 0.85, 1.6 Mbps)`. The default audio budget is 128 kbps and approximately 20 kbps is reserved for container overhead, so the remaining budget is assigned to video. The planner selects a 360p-, 480p-, or 720p-class bounding box from that budget and never upscales.
+
+The bounding box follows the displayed orientation rather than assuming landscape video: portrait input can use `720x1280`, square input can use `720x720`, and arbitrary aspect ratios are reduced with FFmpeg's aspect-ratio-preserving scale filter. Rotation metadata from common `ffprobe` fields is considered before choosing the box. Software, VA-API, and NVENC all receive the same average/max bitrate plan.
+
+```json
+{
+  "input": {"filename": "clip.mp4", "size": 629145600}
+}
+```
+
+This automatic mode is intended for the “upload it and make it reasonably smaller” workflow. Explicit `quality` or `crf` modes remain available for callers who want constant-quality behavior, and named presets such as `web-1080p` remain explicit choices rather than silently changing to the automatic 720p-class limit.
+
 ## Video encoder selection
 
 Select the video codec independently from the server-side encoder mode. `auto` is the default and is normally the best choice: it tries an exposed NVIDIA device with NVENC first, then an exposed VA-API render node (Intel or AMD), and finally retries with the software encoder if hardware startup or transcoding fails. The stored job specification remains the portable high-level request; it never exposes FFmpeg encoder names.
@@ -137,7 +151,7 @@ go run ./cmd/demo-client --file sample.mp4
 
 ## Recursive directory upload
 
-Use [`scripts/upload-directory.sh`](scripts/upload-directory.sh) to submit every supported video file below a directory. Files are processed sequentially, while each file uploads up to four missing chunks in parallel. The script requests the `web-1080p` preset by default and waits through admission, processing, and completion.
+Use [`scripts/upload-directory.sh`](scripts/upload-directory.sh) to submit every supported video file below a directory. Files are processed sequentially, while each file uploads up to four missing chunks in parallel. The script uses automatic compression by default and waits through admission, processing, and completion. Set `OUTPUT_PRESET=web-1080p` or `OUTPUT_PRESET=archive-av1` to select an explicit preset.
 
 ```sh
 scripts/upload-directory.sh http://localhost:8080 /path/to/videos
