@@ -397,7 +397,7 @@ func assertRequestSchemaConstraints(t *testing.T, schemas map[string]any) {
 	assertEnum(t, object(t, videoProperties["encoder"]), "auto", "software", "vaapi", "nvenc")
 	quality := object(t, schemas["Quality"])
 	qualityProperties := object(t, quality["properties"])
-	assertEnum(t, object(t, qualityProperties["mode"]), "quality", "crf")
+	assertEnum(t, object(t, qualityProperties["mode"]), "auto", "quality", "crf")
 	if object(t, qualityProperties["value"])["minimum"] != float64(0) || object(t, qualityProperties["value"])["maximum"] != float64(100) {
 		t.Errorf("quality value schema = %#v, want 0 through 100", qualityProperties["value"])
 	}
@@ -409,7 +409,7 @@ func assertRequestSchemaConstraints(t *testing.T, schemas map[string]any) {
 	}
 	resolution := object(t, schemas["Resolution"])
 	resolutionProperties := object(t, resolution["properties"])
-	assertEnum(t, object(t, resolutionProperties["mode"]), "source", "fit")
+	assertEnum(t, object(t, resolutionProperties["mode"]), "auto", "source", "fit")
 	if object(t, resolutionProperties["width"])["minimum"] != float64(2) || object(t, resolutionProperties["height"])["minimum"] != float64(2) {
 		t.Errorf("resolution schema = %#v, want a minimum of 2 pixels", resolutionProperties)
 	}

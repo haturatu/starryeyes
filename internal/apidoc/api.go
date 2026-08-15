@@ -106,16 +106,16 @@ type Output struct {
 type Video struct {
 	Codec      string     `json:"codec,omitempty" enum:"h264,hevc,av1,vp9" doc:"Video codec. Defaults to h264."`
 	Encoder    string     `json:"encoder,omitempty" enum:"auto,software,vaapi,nvenc" doc:"Encoder mode. Defaults to auto, which prefers a usable NVIDIA NVENC or VA-API encoder and retries with software if hardware encoding fails. software, vaapi, and nvenc require that mode and do not fall back."`
-	Quality    Quality    `json:"quality,omitempty" doc:"Quality mode. Set value for quality mode or crf for CRF mode."`
-	Resolution Resolution `json:"resolution,omitempty" doc:"Resolution mode. Width and height apply only when mode is fit."`
+	Quality    Quality    `json:"quality,omitempty" doc:"Rate-control mode. Defaults to auto, which targets a smaller output with a total bitrate budget; set quality or crf for explicit constant-quality encoding."`
+	Resolution Resolution `json:"resolution,omitempty" doc:"Resolution mode. Defaults to auto, which preserves aspect ratio, avoids upscaling, and limits the output to a 720p-class bounding box. Width and height apply only when mode is fit."`
 }
 type Quality struct {
-	Mode  string `json:"mode,omitempty" enum:"quality,crf" doc:"Quality mode. Defaults to quality."`
+	Mode  string `json:"mode,omitempty" enum:"auto,quality,crf" doc:"Rate-control mode. Defaults to auto; quality maps the public value to an encoder quality setting, and crf passes through an explicit CRF."`
 	Value int    `json:"value,omitempty" minimum:"0" maximum:"100" doc:"Quality value from 0 through 100. Used only when mode is quality."`
 	CRF   int    `json:"crf,omitempty" minimum:"0" maximum:"63" doc:"Constant rate factor. Used only when mode is crf; h264 and hevc allow 0 through 51, av1 and vp9 allow 0 through 63."`
 }
 type Resolution struct {
-	Mode    string `json:"mode,omitempty" enum:"source,fit" doc:"Resolution mode. Defaults to source."`
+	Mode    string `json:"mode,omitempty" enum:"auto,source,fit" doc:"Resolution mode. Defaults to auto; source keeps the input dimensions and fit applies the requested bounding box."`
 	Width   int    `json:"width,omitempty" minimum:"2" doc:"Target width in pixels when mode is fit; must not exceed the configured maximum width."`
 	Height  int    `json:"height,omitempty" minimum:"2" doc:"Target height in pixels when mode is fit; must not exceed the configured maximum height."`
 	Upscale *bool  `json:"upscale,omitempty" doc:"Whether fit mode may enlarge the input. Defaults to false."`
