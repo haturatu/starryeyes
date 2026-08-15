@@ -46,6 +46,21 @@ func TestAutoCompressionPlanUsesTotalBitrateBudget(t *testing.T) {
 	}
 }
 
+func TestAutoCompressionPlanDoesNotUpscaleSmallSource(t *testing.T) {
+	probe := testProbe(640, 360, "3600", 0, "h264", "aac")
+	output := Output{Container: "mp4", Video: Video{Codec: "h264", Quality: Quality{Mode: "auto"}, Resolution: Resolution{Mode: "auto"}}, Audio: Audio{Codec: "aac", BitrateKbps: 128}}
+	plan, err := autoCompressionPlan(2<<30, probe, output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.ResolutionTier != "720p" || plan.TargetWidth != 640 || plan.TargetHeight != 360 {
+		t.Fatalf("small-source auto resolution = %#v, want source-sized 640x360", plan)
+	}
+	if got := scale(plan.Resolution); got != "scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2" {
+		t.Errorf("small-source scale filter = %q", got)
+	}
+}
+
 func TestNormalizeDefaultsToAutomaticCompression(t *testing.T) {
 	output, err := normalize(Request{Input: Input{Filename: "clip.mp4", Size: 1 << 20}}, Config{Capacity: 2 << 30, MaxWidth: 7680, MaxHeight: 4320})
 	if err != nil {
@@ -91,10 +106,10 @@ func TestAutoCompressionPlanKeepsExtremeAspectRatiosSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.TargetWidth != 1280 || plan.TargetHeight != 720 {
-		t.Fatalf("wide bounding box = %dx%d, want 1280x720", plan.TargetWidth, plan.TargetHeight)
+	if plan.TargetWidth != 1280 || plan.TargetHeight != 540 {
+		t.Fatalf("wide output dimensions = %dx%d, want 1280x540", plan.TargetWidth, plan.TargetHeight)
 	}
-	if got := scale(plan.Resolution); got != "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2" {
+	if got := scale(plan.Resolution); got != "scale=1280:540:force_original_aspect_ratio=decrease:force_divisible_by=2" {
 		t.Errorf("wide scale filter = %q", got)
 	}
 }
@@ -111,6 +126,9 @@ func TestAutoCompressionPlanDoesNotCreateNegativeRates(t *testing.T) {
 	}
 	if plan.Copy && plan.VideoBitrate != 0 {
 		t.Fatalf("copy plan still has a video rate: %#v", plan)
+	}
+	if plan.Copy && (plan.TargetTotalBitrate != plan.SourceTotalBitrate || plan.MaxTotalBitrate != plan.SourceTotalBitrate) {
+		t.Fatalf("copy plan reports a re-encode budget: %#v", plan)
 	}
 }
 
@@ -131,6 +149,18 @@ func TestFFmpegAutoCompressionArguments(t *testing.T) {
 		if !slices.Contains(command.Args, want) {
 			t.Errorf("auto command lacks %q: %q", want, command.Args)
 		}
+	}
+	if !slices.Contains(command.Args, "0:a:0?") || slices.Contains(command.Args, "0:a?") {
+		t.Errorf("auto command maps unexpected audio streams: %q", command.Args)
+	}
+	explicit := requested
+	explicit.Video.Quality = Quality{Mode: "crf", CRF: 23}
+	explicitCommand, err := server.ffmpegCmd(cgroup{}, job, explicit, "output.mp4", videoEncoder{mode: "software", name: "libx264"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(explicitCommand.Args, "0:a?") || slices.Contains(explicitCommand.Args, "0:a:0?") {
+		t.Errorf("explicit command changed audio mapping: %q", explicitCommand.Args)
 	}
 	if slices.Contains(command.Args, "-crf") || slices.Contains(command.Args, "-qp") || slices.Contains(command.Args, "-cq") {
 		t.Errorf("auto command unexpectedly uses constant-quality control: %q", command.Args)
