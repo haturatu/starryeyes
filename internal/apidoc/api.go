@@ -122,7 +122,7 @@ type Resolution struct {
 }
 type Audio struct {
 	Codec       string `json:"codec,omitempty" enum:"aac,opus,flac" doc:"Audio codec. Defaults to aac."`
-	BitrateKbps int    `json:"bitrate_kbps,omitempty" minimum:"16" maximum:"512" doc:"Audio bitrate in kbps. Automatic compression defaults to 128; explicit presets may choose another value."`
+	BitrateKbps int    `json:"bitrate_kbps,omitempty" minimum:"16" maximum:"512" doc:"Audio bitrate in kbps. Automatic compression defaults to 128 and keeps the first audio track; explicit presets may choose another value."`
 }
 
 // Handlers is the runtime implementation for the documented operations.

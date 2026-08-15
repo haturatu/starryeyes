@@ -8,7 +8,7 @@ The public API accepts a validated, high-level output specification. It never ac
 
 When `output` is omitted, Starryeyes uses an automatic compression plan. It estimates the input's total bitrate from the uploaded byte size and the probed duration, then targets `min(input bitrate * 0.85, 1.6 Mbps)`. The default audio budget is 128 kbps and approximately 20 kbps is reserved for container overhead, so the remaining budget is assigned to video. The planner selects a 360p-, 480p-, or 720p-class bounding box from that budget and never upscales.
 
-The bounding box follows the displayed orientation rather than assuming landscape video: portrait input can use `720x1280`, square input can use `720x720`, and arbitrary aspect ratios are reduced with FFmpeg's aspect-ratio-preserving scale filter. Rotation metadata from common `ffprobe` fields is considered before choosing the box. Software, VA-API, and NVENC all receive the same average/max bitrate plan.
+The bounding box follows the displayed orientation rather than assuming landscape video: portrait input can use `720x1280`, square input can use `720x720`, and arbitrary aspect ratios are reduced with FFmpeg's aspect-ratio-preserving scale filter. The planner also computes the actual fitted dimensions, so small sources are never upscaled. Rotation metadata from common `ffprobe` fields is considered before choosing the box. Automatic compression keeps only the first audio track so the total bitrate budget remains predictable. Software, VA-API, and NVENC all receive the same average/max bitrate plan.
 
 ```json
 {
