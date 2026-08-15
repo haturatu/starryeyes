@@ -1075,7 +1075,13 @@ func (s *Server) ffmpegCmdWithPlan(c cgroup, j Job, o Output, artifact string, s
 	if selected.mode == "vaapi" {
 		a = append(a, "-vaapi_device", selected.devices[0])
 	}
-	a = append(a, "-i", in, "-map", "0:v:0?", "-map", "0:a?", "-c:v", selected.name)
+	audioMap := "0:a?"
+	if plan != nil {
+		// Automatic compression has a total bitrate budget. Keeping only the
+		// first audio stream makes that budget predictable for multi-track input.
+		audioMap = "0:a:0?"
+	}
+	a = append(a, "-i", in, "-map", "0:v:0?", "-map", audioMap, "-c:v", selected.name)
 	resolution := o.Video.Resolution
 	if plan != nil {
 		resolution = plan.Resolution

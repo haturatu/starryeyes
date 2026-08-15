@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -156,19 +157,23 @@ func autoCompressionPlan(inputSize int64, probe Probe, output Output) (AutoCompr
 		// used only when it already satisfies the auto resolution and codec
 		// defaults; otherwise keep a valid, very small transcode request.
 		tier := chooseCompressionTier(targetTotal)
-		boxWidth, boxHeight := compressionBounds(tier, displayWidth, displayHeight)
+		targetWidth, targetHeight := compressionTargetDimensions(output.Video.Resolution, tier, displayWidth, displayHeight)
 		plan := AutoCompressionPlan{
 			SourceTotalBitrate: sourceTotal,
 			TargetTotalBitrate: targetTotal,
 			MaxTotalBitrate:    maxTotal,
 			ResolutionTier:     tier.Name,
-			TargetWidth:        boxWidth,
-			TargetHeight:       boxHeight,
+			TargetWidth:        targetWidth,
+			TargetHeight:       targetHeight,
 			AudioBitrateKbps:   int(maxInt64(audioBps, autoMinimumAudioBps) / 1000),
-			Resolution:         autoPlanResolution(output.Video.Resolution, boxWidth, boxHeight),
-			Copy:               autoCopySafe(probe, output, displayWidth, displayHeight, boxWidth, boxHeight),
+			Resolution:         autoPlanResolution(output.Video.Resolution, targetWidth, targetHeight),
+			Copy:               autoCopySafe(probe, output, displayWidth, displayHeight, targetWidth, targetHeight),
 		}
 		if plan.Copy {
+			// Stream copy preserves the source bitrate. Reflect that exception in
+			// the plan instead of reporting a budget that the output cannot meet.
+			plan.TargetTotalBitrate = sourceTotal
+			plan.MaxTotalBitrate = sourceTotal
 			return plan, nil
 		}
 		videoTarget = 1_000
@@ -179,18 +184,18 @@ func autoCompressionPlan(inputSize int64, probe Probe, output Output) (AutoCompr
 	}
 
 	tier := chooseCompressionTier(targetTotal)
-	boxWidth, boxHeight := compressionBounds(tier, displayWidth, displayHeight)
+	targetWidth, targetHeight := compressionTargetDimensions(output.Video.Resolution, tier, displayWidth, displayHeight)
 	return AutoCompressionPlan{
 		SourceTotalBitrate: sourceTotal,
 		TargetTotalBitrate: targetTotal,
 		MaxTotalBitrate:    maxTotal,
 		ResolutionTier:     tier.Name,
-		TargetWidth:        boxWidth,
-		TargetHeight:       boxHeight,
+		TargetWidth:        targetWidth,
+		TargetHeight:       targetHeight,
 		VideoBitrate:       videoTarget,
 		VideoMaxrate:       videoMaxrate,
 		AudioBitrateKbps:   int(audioBps / 1000),
-		Resolution:         autoPlanResolution(output.Video.Resolution, boxWidth, boxHeight),
+		Resolution:         autoPlanResolution(output.Video.Resolution, targetWidth, targetHeight),
 	}, nil
 }
 
@@ -217,6 +222,61 @@ func compressionBounds(tier compressionResolutionTier, width, height int) (int, 
 		return tier.PortraitWidth, tier.PortraitHeight
 	}
 	return tier.LandscapeWidth, tier.LandscapeHeight
+}
+
+func compressionTargetDimensions(requested Resolution, tier compressionResolutionTier, sourceWidth, sourceHeight int) (int, int) {
+	switch requested.Mode {
+	case "source":
+		return sourceWidth, sourceHeight
+	case "fit":
+		return requested.Width, requested.Height
+	default:
+		return fitCompressionBounds(tier, sourceWidth, sourceHeight)
+	}
+}
+
+func fitCompressionBounds(tier compressionResolutionTier, sourceWidth, sourceHeight int) (int, int) {
+	boxWidth, boxHeight := compressionBounds(tier, sourceWidth, sourceHeight)
+	if sourceWidth <= boxWidth && sourceHeight <= boxHeight {
+		return evenAtMost(sourceWidth, sourceWidth), evenAtMost(sourceHeight, sourceHeight)
+	}
+
+	var targetWidth, targetHeight int
+	if int64(sourceWidth)*int64(boxHeight) > int64(sourceHeight)*int64(boxWidth) {
+		targetWidth = boxWidth
+		targetHeight = roundedEven(int64(sourceHeight)*int64(boxWidth), int64(sourceWidth))
+	} else {
+		targetHeight = boxHeight
+		targetWidth = roundedEven(int64(sourceWidth)*int64(boxHeight), int64(sourceHeight))
+	}
+	return evenAtMost(targetWidth, minInt(sourceWidth, boxWidth)), evenAtMost(targetHeight, minInt(sourceHeight, boxHeight))
+}
+
+func roundedEven(numerator, denominator int64) int {
+	if numerator <= 0 || denominator <= 0 {
+		return 0
+	}
+	return int(math.Round(float64(numerator)/float64(denominator)/2) * 2)
+}
+
+func evenAtMost(value, limit int) int {
+	if value > limit {
+		value = limit
+	}
+	if value%2 != 0 {
+		value--
+	}
+	if value < 2 && limit >= 2 {
+		return 2
+	}
+	return value
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func autoPlanResolution(requested Resolution, width, height int) Resolution {
