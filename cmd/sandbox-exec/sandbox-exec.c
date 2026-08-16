@@ -35,6 +35,16 @@ static void allow_path(int ruleset, const char *path, uint64_t rights) {
   if(ll_add(ruleset,&a)<0) die("landlock_add_rule");
   close(fd);
 }
+static void allow_optional_path(int ruleset, const char *path, uint64_t rights) {
+  int fd=open(path,O_PATH|O_CLOEXEC);
+  if(fd<0) {
+    if(errno==ENOENT || errno==ENOTDIR) return;
+    die(path);
+  }
+  struct landlock_path_beneath_attr a={.allowed_access=rights,.parent_fd=fd};
+  if(ll_add(ruleset,&a)<0) die("landlock_add_rule");
+  close(fd);
+}
 /* Mesa/libdrm resolves DRM device metadata through these read-only sysfs trees. */
 static void allow_gpu_sysfs(int ruleset) {
   uint64_t ro=LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_READ_DIR;
@@ -42,6 +52,11 @@ static void allow_gpu_sysfs(int ruleset) {
   allow_path(ruleset,"/sys/class/drm",ro);
   allow_path(ruleset,"/sys/bus",ro);
   allow_path(ruleset,"/sys/devices",ro);
+}
+static void allow_nvidia_proc(int ruleset) {
+  uint64_t ro=LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_READ_DIR;
+  /* NVIDIA userspace uses this tree for driver and capability discovery. */
+  allow_optional_path(ruleset,"/proc/driver/nvidia",ro);
 }
 static void landlock(const char *input, const char *output, const char **gpu_devices, int gpu_count) {
   int abi=ll_create(NULL,0,LANDLOCK_CREATE_RULESET_VERSION);
@@ -62,9 +77,13 @@ static void landlock(const char *input, const char *output, const char **gpu_dev
   allow_path(fd,"/dev/urandom",LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_WRITE_FILE);
   for(int i=0;i<gpu_count;i++) allow_path(fd,gpu_devices[i],LANDLOCK_ACCESS_FS_READ_FILE|LANDLOCK_ACCESS_FS_WRITE_FILE);
   if(gpu_count>0) {
-    /* libdrm also opens this directory to enumerate DRM nodes. */
-    allow_path(fd,"/dev/dri",LANDLOCK_ACCESS_FS_READ_DIR);
+    /* libdrm opens this directory when a DRM node is present. NVIDIA-only
+     * containers may not expose /dev/dri, so it is optional here; a VA-API
+     * render node passed above remains mandatory. */
+    allow_optional_path(fd,"/dev/dri",LANDLOCK_ACCESS_FS_READ_DIR);
+    allow_optional_path(fd,"/dev/nvidia-caps",LANDLOCK_ACCESS_FS_READ_DIR);
     allow_gpu_sysfs(fd);
+    allow_nvidia_proc(fd);
   }
   allow_path(fd,input,LANDLOCK_ACCESS_FS_READ_FILE);
   allow_path(fd,"/tmp",rw);
@@ -81,7 +100,7 @@ static int numeric_suffix(const char *path, const char *prefix) {
   return 1;
 }
 static int valid_gpu_device(const char *path) {
-  return numeric_suffix(path,"/dev/dri/renderD") || numeric_suffix(path,"/dev/nvidia") || !strcmp(path,"/dev/nvidiactl") || !strcmp(path,"/dev/nvidia-uvm") || !strcmp(path,"/dev/nvidia-uvm-tools");
+  return numeric_suffix(path,"/dev/dri/renderD") || numeric_suffix(path,"/dev/nvidia") || numeric_suffix(path,"/dev/nvidia-caps/nvidia-cap") || !strcmp(path,"/dev/nvidiactl") || !strcmp(path,"/dev/nvidia-modeset") || !strcmp(path,"/dev/nvidia-uvm") || !strcmp(path,"/dev/nvidia-uvm-tools");
 }
 int main(int argc,char **argv){
   if(argc==2&&!strcmp(argv[1],"--check")){int a=ll_create(NULL,0,LANDLOCK_CREATE_RULESET_VERSION);return a>=REQUIRED_LANDLOCK_ABI?0:1;}

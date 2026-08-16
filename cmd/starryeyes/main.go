@@ -1262,9 +1262,11 @@ func vaapiRenderNode(path string) bool {
 }
 
 func nvidiaDevices() []string {
-	paths := []string{"/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"}
+	paths := []string{"/dev/nvidiactl", "/dev/nvidia-modeset", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"}
 	indexed, _ := filepath.Glob("/dev/nvidia[0-9]*")
 	paths = append(paths, indexed...)
+	caps, _ := filepath.Glob("/dev/nvidia-caps/nvidia-cap*")
+	paths = append(paths, caps...)
 	devices := make([]string, 0, len(paths))
 	hasGPU := false
 	for _, path := range paths {
