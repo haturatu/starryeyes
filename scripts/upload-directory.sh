@@ -14,7 +14,7 @@ Arguments:
   directory   Directory to scan recursively
 
 Environment:
-  OUTPUT_PRESET             Output preset (default: web-1080p)
+  OUTPUT_PRESET             Output preset (default: automatic compression)
   UPLOAD_PARALLELISM        Concurrent chunk uploads per file (default: 4)
   ADMISSION_POLL_SECONDS    Capacity-admission poll interval (default: 10)
   JOB_POLL_SECONDS          Processing-status poll interval (default: 10)
@@ -342,7 +342,7 @@ upload_file() (
 
 server_url=${1%/}
 source_dir=$2
-OUTPUT_PRESET=${OUTPUT_PRESET:-web-1080p}
+OUTPUT_PRESET=${OUTPUT_PRESET-}
 UPLOAD_PARALLELISM=${UPLOAD_PARALLELISM:-4}
 ADMISSION_POLL_SECONDS=${ADMISSION_POLL_SECONDS:-10}
 JOB_POLL_SECONDS=${JOB_POLL_SECONDS:-10}

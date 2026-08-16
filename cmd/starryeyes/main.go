@@ -65,6 +65,7 @@ type Server struct {
 }
 type Job struct {
 	ID, State, Filename, Spec, InputHash, ActualHash string
+	ProbeJSON                                        string
 	Size, Received, Reserved, ChunkSize              int64
 	Chunks, Expected                                 int
 	Error, Artifact, ExpiresAt                       sql.NullString
@@ -74,14 +75,20 @@ type Probe struct {
 	Format struct {
 		Duration string `json:"duration"`
 	} `json:"format"`
-	Streams []struct {
-		CodecType    string `json:"codec_type"`
-		Width        int    `json:"width"`
-		Height       int    `json:"height"`
-		CodecName    string `json:"codec_name"`
-		PixFmt       string `json:"pix_fmt"`
-		AvgFrameRate string `json:"avg_frame_rate"`
-	} `json:"streams"`
+	Streams []ProbeStream `json:"streams"`
+}
+type ProbeStream struct {
+	CodecType    string            `json:"codec_type"`
+	Width        int               `json:"width"`
+	Height       int               `json:"height"`
+	CodecName    string            `json:"codec_name"`
+	PixFmt       string            `json:"pix_fmt"`
+	AvgFrameRate string            `json:"avg_frame_rate"`
+	Rotation     int               `json:"rotation"`
+	Tags         map[string]string `json:"tags"`
+	SideDataList []struct {
+		Rotation int `json:"rotation"`
+	} `json:"side_data_list"`
 }
 
 func main() {
@@ -682,7 +689,7 @@ func (s *Server) prepareInput(j Job) error {
 
 func (s *Server) job(id string) (Job, error) {
 	var j Job
-	e := s.db.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,chunk_size,spec,COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact,created_at,expires_at FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.State, &j.Filename, &j.Size, &j.Received, &j.Chunks, &j.Expected, &j.ChunkSize, &j.Spec, &j.InputHash, &j.ActualHash, &j.Reserved, &j.Error, &j.Artifact, &j.CreatedAt, &j.ExpiresAt)
+	e := s.db.QueryRow(`SELECT id,state,filename,size,received,chunks,expected,chunk_size,spec,COALESCE(probe_json,''),COALESCE(input_hash,''),COALESCE(actual_hash,''),reserved,error,artifact,created_at,expires_at FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.State, &j.Filename, &j.Size, &j.Received, &j.Chunks, &j.Expected, &j.ChunkSize, &j.Spec, &j.ProbeJSON, &j.InputHash, &j.ActualHash, &j.Reserved, &j.Error, &j.Artifact, &j.CreatedAt, &j.ExpiresAt)
 	return j, e
 }
 func (s *Server) recover() error {
@@ -939,10 +946,23 @@ func (s *Server) run(jid string) {
 		return
 	}
 	artifact := "output." + o.Container
-	encoders, e := s.videoEncoders(o.Video)
-	if e != nil {
-		s.fail(jid, e)
-		return
+	var plan *AutoCompressionPlan
+	if o.Video.Quality.Mode == "auto" {
+		plan, e = autoPlanForJob(j, o)
+		if e != nil {
+			s.fail(jid, fmt.Errorf("auto compression plan: %w", e))
+			return
+		}
+	}
+	var encoders []videoEncoder
+	if plan != nil && plan.Copy {
+		encoders = []videoEncoder{{mode: "copy", name: "copy"}}
+	} else {
+		encoders, e = s.videoEncoders(o.Video)
+		if e != nil {
+			s.fail(jid, e)
+			return
+		}
 	}
 	var transcodeErr error
 	var lastEncoder videoEncoder
@@ -953,7 +973,7 @@ func (s *Server) run(jid string) {
 		lastEncoder = selected
 		ffmpegLog := s.component("ffmpeg").With("job_id", jid, "encoder", selected.name, "encoder_type", selected.mode)
 		ffmpegLog.Info("encoder selected", "event", "encoder.selected")
-		cmd, e := s.ffmpegCmd(cg, j, o, artifact, selected)
+		cmd, e := s.ffmpegCmdWithPlan(cg, j, o, artifact, selected, plan)
 		if e != nil {
 			s.fail(jid, fmt.Errorf("build ffmpeg command: %w", e))
 			return
@@ -1023,13 +1043,31 @@ func (s *Server) probeCmd(in string) *exec.Cmd {
 	return s.sandbox(nil, in, "", nil, []string{"/usr/bin/ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", in})
 }
 func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected videoEncoder) (*exec.Cmd, error) {
-	quality, err := crf(o.Video)
-	if err != nil {
-		return nil, err
+	var plan *AutoCompressionPlan
+	if o.Video.Quality.Mode == "auto" {
+		plan, _ = autoPlanForJob(j, o)
+		if plan == nil {
+			plan = fallbackAutoCompressionPlan(o)
+		}
 	}
-	audioCodec, err := audioEncoder(o.Audio.Codec)
-	if err != nil {
-		return nil, err
+	return s.ffmpegCmdWithPlan(c, j, o, artifact, selected, plan)
+}
+func (s *Server) ffmpegCmdWithPlan(c cgroup, j Job, o Output, artifact string, selected videoEncoder, plan *AutoCompressionPlan) (*exec.Cmd, error) {
+	quality := 0
+	if plan == nil {
+		var err error
+		quality, err = crf(o.Video)
+		if err != nil {
+			return nil, err
+		}
+	}
+	audioCodec := ""
+	if plan == nil || !plan.Copy {
+		var err error
+		audioCodec, err = audioEncoder(o.Audio.Codec)
+		if err != nil {
+			return nil, err
+		}
 	}
 	in := filepath.Join(s.dir(j.ID), "input")
 	outDir := s.outputDir(j.ID)
@@ -1037,8 +1075,23 @@ func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected 
 	if selected.mode == "vaapi" {
 		a = append(a, "-vaapi_device", selected.devices[0])
 	}
-	a = append(a, "-i", in, "-map", "0:v:0?", "-map", "0:a?", "-c:v", selected.name)
-	filter := scale(o.Video.Resolution)
+	audioMap := "0:a?"
+	if plan != nil {
+		// Automatic compression has a total bitrate budget. Keeping only the
+		// first audio stream makes that budget predictable for multi-track input.
+		audioMap = "0:a:0?"
+	}
+	a = append(a, "-i", in, "-map", "0:v:0?", "-map", audioMap, "-c:v", selected.name)
+	resolution := o.Video.Resolution
+	if plan != nil {
+		resolution = plan.Resolution
+	} else if resolution.Mode == "auto" {
+		resolution = Resolution{Mode: "source"}
+	}
+	filter := ""
+	if plan == nil || !plan.Copy {
+		filter = scale(resolution)
+	}
 	if selected.mode == "vaapi" {
 		if filter != "" {
 			filter += ","
@@ -1048,15 +1101,37 @@ func (s *Server) ffmpegCmd(c cgroup, j Job, o Output, artifact string, selected 
 	if filter != "" {
 		a = append(a, "-vf", filter)
 	}
-	switch selected.mode {
-	case "vaapi":
-		a = append(a, "-qp", strconv.Itoa(quality))
-	case "nvenc":
-		a = append(a, "-rc", "vbr", "-cq", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
-	default:
-		a = append(a, "-crf", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
+	if plan != nil && plan.Copy {
+		a = append(a, "-c:v", "copy")
+	} else if plan != nil {
+		if selected.mode == "vaapi" {
+			a = append(a, "-rc_mode", "VBR")
+		} else if selected.mode == "nvenc" {
+			a = append(a, "-rc", "vbr")
+		}
+		a = append(a, "-b:v", bitrateArg(plan.VideoBitrate), "-maxrate", bitrateArg(plan.VideoMaxrate), "-bufsize", bitrateArg(plan.VideoMaxrate*2))
+		if selected.mode != "vaapi" {
+			a = append(a, "-pix_fmt", "yuv420p")
+		}
+	} else {
+		switch selected.mode {
+		case "vaapi":
+			a = append(a, "-qp", strconv.Itoa(quality))
+		case "nvenc":
+			a = append(a, "-rc", "vbr", "-cq", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
+		default:
+			a = append(a, "-crf", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
+		}
 	}
-	a = append(a, "-c:a", audioCodec, "-b:a", strconv.Itoa(o.Audio.BitrateKbps)+"k")
+	if plan != nil && plan.Copy {
+		a = append(a, "-c:a", "copy")
+	} else {
+		audioKbps := o.Audio.BitrateKbps
+		if plan != nil {
+			audioKbps = plan.AudioBitrateKbps
+		}
+		a = append(a, "-c:a", audioCodec, "-b:a", strconv.Itoa(audioKbps)+"k")
+	}
 	if o.Container == "mp4" {
 		a = append(a, "-movflags", "+faststart")
 	}
@@ -1251,11 +1326,13 @@ func normalize(r Request, c Config) (Output, error) {
 	if r.Input.SHA256 != "" && !validSHA256(r.Input.SHA256) {
 		return Output{}, errors.New("input sha256 must be hex SHA-256")
 	}
-	base := Output{Container: "mp4", Video: Video{Codec: "h264", Encoder: "auto", Quality: Quality{Mode: "quality", Value: 72}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "aac", BitrateKbps: 160}}
+	base := Output{Container: "mp4", Video: Video{Codec: "h264", Encoder: "auto", Quality: Quality{Mode: "auto"}, Resolution: Resolution{Mode: "auto"}}, Audio: Audio{Codec: "aac", BitrateKbps: autoDefaultAudioKbps}}
 	if r.Output.Preset != "" {
 		switch r.Output.Preset {
 		case "web-1080p":
+			base.Video.Quality = Quality{Mode: "quality", Value: 72}
 			base.Video.Resolution = Resolution{Mode: "fit", Width: 1920, Height: 1080}
+			base.Audio.BitrateKbps = 160
 		case "archive-av1":
 			base = Output{Container: "mkv", Video: Video{Codec: "av1", Encoder: "auto", Quality: Quality{Mode: "quality", Value: 80}, Resolution: Resolution{Mode: "source"}}, Audio: Audio{Codec: "opus", BitrateKbps: 192}}
 		default:
@@ -1280,6 +1357,8 @@ func normalize(r Request, c Config) (Output, error) {
 		return o, errors.New("audio bitrate out of range")
 	}
 	switch o.Video.Quality.Mode {
+	case "auto":
+		// The automatic rate-control plan is resolved after ffprobe.
 	case "quality":
 		if o.Video.Quality.Value < 0 || o.Video.Quality.Value > 100 {
 			return o, errors.New("quality out of range")
@@ -1297,6 +1376,8 @@ func normalize(r Request, c Config) (Output, error) {
 	}
 	resol := o.Video.Resolution
 	switch resol.Mode {
+	case "auto":
+		// The automatic resolution is resolved after ffprobe.
 	case "source":
 		// The source resolution does not need dimensions.
 	case "fit":
