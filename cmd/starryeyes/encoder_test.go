@@ -312,6 +312,23 @@ func TestFFmpegHardwareEncoderArguments(t *testing.T) {
 		t.Errorf("VA-API sandbox command lacks GPU device permission: %q", vaapi.Args)
 	}
 
+	nvenc, err := server.ffmpegCmd(cgroup{}, job, requested, "output.mp4", videoEncoder{mode: "nvenc", name: "hevc_nvenc", devices: []string{"/dev/nvidia0"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(nvenc.Args, "-hwaccel") || !slices.Contains(nvenc.Args, "cuda") || !slices.Contains(nvenc.Args, "-hwaccel_output_format") {
+		t.Errorf("NVENC command lacks CUDA input acceleration: %q", nvenc.Args)
+	}
+	if !slices.Contains(nvenc.Args, "scale_cuda=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p") {
+		t.Errorf("NVENC command lacks aspect-safe CUDA scaling: %q", nvenc.Args)
+	}
+	if !slices.Contains(nvenc.Args, "-cq") || slices.Contains(nvenc.Args, "-pix_fmt") {
+		t.Errorf("NVENC rate-control arguments = %q, want CQ without a software pixel format", nvenc.Args)
+	}
+	if !slices.Contains(nvenc.Args, "--gpu-device") {
+		t.Errorf("NVENC sandbox command lacks GPU device permission: %q", nvenc.Args)
+	}
+
 	software, err := server.ffmpegCmd(cgroup{}, job, requested, "output.mp4", videoEncoder{mode: "software", name: "libx265"})
 	if err != nil {
 		t.Fatal(err)

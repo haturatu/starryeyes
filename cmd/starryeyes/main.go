@@ -479,6 +479,7 @@ func (s *Server) finalize(jid string) {
 func (s *Server) probeAndQueue(jid, in string) {
 	if _, e := s.db.Exec(`UPDATE jobs SET state=? WHERE id=? AND state=?`, probing, jid, staged); e != nil {
 		s.component("db").Error("update job state", "event", "job.state_update_failed", "job_id", jid, "state", probing, "error", e)
+		s.fail(jid, e)
 		return
 	}
 	probeLog := s.component("ffprobe").With("job_id", jid)
@@ -509,10 +510,12 @@ func (s *Server) probeAndQueue(jid, in string) {
 	pb, _ := json.Marshal(p)
 	if _, e = s.db.Exec(`UPDATE jobs SET state=?,probe_json=? WHERE id=? AND state=?`, validated, string(pb), jid, probing); e != nil {
 		s.component("db").Error("store probe result", "event", "probe.persist_failed", "job_id", jid, "error", e)
+		s.fail(jid, e)
 		return
 	}
 	if _, e = s.db.Exec(`UPDATE jobs SET state=? WHERE id=? AND state=?`, queued, jid, validated); e != nil {
 		s.component("db").Error("queue job", "event", "job.queue_failed", "job_id", jid, "error", e)
+		s.fail(jid, e)
 		return
 	}
 	s.component("scheduler").Info("job queued", "event", "job.queued", "job_id", jid)
@@ -642,6 +645,9 @@ func (s *Server) reservePending(j Job) error {
 		return e
 	}
 	defer tx.Rollback()
+	if e = s.ensureSpoolSpace(tx, reserved); e != nil {
+		return e
+	}
 	result, e := tx.Exec(`UPDATE capacity SET reserved=reserved+? WHERE id=1 AND reserved+?<=total`, reserved, reserved)
 	if e != nil {
 		return e
@@ -662,6 +668,33 @@ func (s *Server) reservePending(j Job) error {
 	return tx.Commit()
 }
 
+// ensureSpoolSpace keeps sparse-file reservations from overcommitting the
+// filesystem. The database reservation is logical, while statfs accounts for
+// the physical free space that all outstanding reservations may consume.
+func (s *Server) ensureSpoolSpace(tx *sql.Tx, additional int64) error {
+	var reserved int64
+	if e := tx.QueryRow(`SELECT reserved FROM capacity WHERE id=1`).Scan(&reserved); e != nil {
+		return e
+	}
+	if reserved < 0 || additional < 0 {
+		return errCapacityUnavailable
+	}
+
+	var stat unix.Statfs_t
+	if e := unix.Statfs(s.cfg.Data, &stat); e != nil {
+		return fmt.Errorf("spool space check: %w", e)
+	}
+	if stat.Bsize <= 0 {
+		return errors.New("spool space check: invalid filesystem block size")
+	}
+	free := uint64(stat.Bavail) * uint64(stat.Bsize)
+	required := uint64(reserved) + uint64(additional)
+	if required < uint64(reserved) || free < required {
+		return errCapacityUnavailable
+	}
+	return nil
+}
+
 func (s *Server) prepareInput(j Job) error {
 	dir := s.dir(j.ID)
 	if e := os.MkdirAll(dir, 0750); e != nil {
@@ -677,10 +710,10 @@ func (s *Server) prepareInput(j Job) error {
 		return e
 	}
 	if info.Size() != j.Size {
-		if e = f.Truncate(0); e != nil {
-			return e
-		}
-		if e = unix.Fallocate(int(f.Fd()), 0, 0, j.Size); e != nil {
+		// Keep the logical size for random-access chunk uploads without
+		// allocating the entire input before the client sends any data.
+		// Physical blocks are consumed as chunks are written.
+		if e = f.Truncate(j.Size); e != nil {
 			return e
 		}
 	}
@@ -699,6 +732,7 @@ func (s *Server) recover() error {
 	if e := s.reconcileResumableUploads(); e != nil {
 		return e
 	}
+	s.cleanupTerminalSpools()
 	if _, e := s.db.Exec(`UPDATE jobs SET state=? WHERE state IN (?,?)`, queued, starting, transcoding); e != nil {
 		return e
 	}
@@ -726,6 +760,74 @@ func (s *Server) recover() error {
 	go s.admitPending()
 	s.schedule()
 	return nil
+}
+
+// cleanupTerminalSpools removes input files that are no longer needed after a
+// job reaches a terminal state. It also removes orphaned job directories left
+// behind by an interrupted process. Active and resumable jobs are preserved.
+func (s *Server) cleanupTerminalSpools() {
+	root := filepath.Join(s.cfg.Data, "spool")
+	entries, e := os.ReadDir(root)
+	if e != nil {
+		s.component("storage").Error("scan spool for cleanup", "event", "storage.spool_scan_failed", "error", e)
+		return
+	}
+
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		jobID := entry.Name()
+		var state string
+		e = s.db.QueryRow(`SELECT state FROM jobs WHERE id=?`, jobID).Scan(&state)
+		remove := (e == nil && terminalJobState(state)) || (e == sql.ErrNoRows && looksLikeJobID(jobID))
+		if e != nil && e != sql.ErrNoRows {
+			s.component("storage").Error("inspect spool entry", "event", "storage.spool_inspect_failed", "job_id", jobID, "error", e)
+			continue
+		}
+		if !remove {
+			continue
+		}
+		if e = os.RemoveAll(filepath.Join(root, jobID)); e != nil {
+			s.component("storage").Error("remove stale job spool", "event", "storage.spool_cleanup_failed", "job_id", jobID, "error", e)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		s.component("storage").Info("removed stale job spools", "event", "storage.spool_cleanup_completed", "count", removed)
+	}
+}
+
+func (s *Server) cleanupSpool(jobID string) {
+	if jobID == "" {
+		return
+	}
+	if e := os.RemoveAll(s.dir(jobID)); e != nil {
+		s.component("storage").Error("remove job spool", "event", "storage.spool_cleanup_failed", "job_id", jobID, "error", e)
+	}
+}
+
+func terminalJobState(state string) bool {
+	switch state {
+	case completed, failed, expired:
+		return true
+	default:
+		return false
+	}
+}
+
+func looksLikeJobID(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, r := range value {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) runUploadGC() {
@@ -922,6 +1024,7 @@ func (s *Server) run(jid string) {
 		s.component("db").Error("load queued job", "event", "job.load_failed", "job_id", jid, "error", e)
 		return
 	}
+	defer s.cleanupSpool(jid)
 	cg, e := s.makeCgroup(jid)
 	if e != nil {
 		s.fail(jid, e)
@@ -930,6 +1033,7 @@ func (s *Server) run(jid string) {
 	defer cg.cleanup()
 	if _, e = s.db.Exec(`UPDATE jobs SET state=? WHERE id=?`, transcoding, jid); e != nil {
 		s.component("db").Error("update job state", "event", "job.state_update_failed", "job_id", jid, "state", transcoding, "error", e)
+		s.fail(jid, e)
 		return
 	}
 	workerLog := s.component("worker").With("job_id", jid)
@@ -1023,6 +1127,7 @@ func (s *Server) fail(jid string, e error) {
 		s.release(j)
 	}
 	s.db.Exec(`UPDATE jobs SET state=?,error=?,finished_at=? WHERE id=? AND state NOT IN (?,?)`, failed, e.Error(), time.Now().UTC(), jid, completed, failed)
+	s.cleanupSpool(jid)
 	s.component("worker").Error("job failed", "event", "job.failed", "job_id", jid, "error", e)
 }
 func (s *Server) release(j Job) {
@@ -1072,16 +1177,15 @@ func (s *Server) ffmpegCmdWithPlan(c cgroup, j Job, o Output, artifact string, s
 	in := filepath.Join(s.dir(j.ID), "input")
 	outDir := s.outputDir(j.ID)
 	a := []string{"/usr/bin/ffmpeg", "-y", "-nostdin", "-hide_banner", "-v", "error", "-protocol_whitelist", "file,pipe"}
-	if selected.mode == "vaapi" {
-		a = append(a, "-vaapi_device", selected.devices[0])
-	}
+	copyVideo := plan != nil && plan.Copy
+	a = append(a, inputHardwareArgs(selected, copyVideo)...)
 	audioMap := "0:a?"
 	if plan != nil {
 		// Automatic compression has a total bitrate budget. Keeping only the
 		// first audio stream makes that budget predictable for multi-track input.
 		audioMap = "0:a:0?"
 	}
-	a = append(a, "-i", in, "-map", "0:v:0?", "-map", audioMap, "-c:v", selected.name)
+	a = append(a, "-i", in, "-map", "0:v:0?", "-map", audioMap)
 	resolution := o.Video.Resolution
 	if plan != nil {
 		resolution = plan.Resolution
@@ -1089,40 +1193,13 @@ func (s *Server) ffmpegCmdWithPlan(c cgroup, j Job, o Output, artifact string, s
 		resolution = Resolution{Mode: "source"}
 	}
 	filter := ""
-	if plan == nil || !plan.Copy {
-		filter = scale(resolution)
-	}
-	if selected.mode == "vaapi" {
-		if filter != "" {
-			filter += ","
-		}
-		filter += "format=nv12,hwupload"
+	if !copyVideo {
+		filter = videoFilter(selected, resolution)
 	}
 	if filter != "" {
 		a = append(a, "-vf", filter)
 	}
-	if plan != nil && plan.Copy {
-		a = append(a, "-c:v", "copy")
-	} else if plan != nil {
-		if selected.mode == "vaapi" {
-			a = append(a, "-rc_mode", "VBR")
-		} else if selected.mode == "nvenc" {
-			a = append(a, "-rc", "vbr")
-		}
-		a = append(a, "-b:v", bitrateArg(plan.VideoBitrate), "-maxrate", bitrateArg(plan.VideoMaxrate), "-bufsize", bitrateArg(plan.VideoMaxrate*2))
-		if selected.mode != "vaapi" {
-			a = append(a, "-pix_fmt", "yuv420p")
-		}
-	} else {
-		switch selected.mode {
-		case "vaapi":
-			a = append(a, "-qp", strconv.Itoa(quality))
-		case "nvenc":
-			a = append(a, "-rc", "vbr", "-cq", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
-		default:
-			a = append(a, "-crf", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
-		}
-	}
+	a = append(a, videoEncoderArgs(selected, plan, quality)...)
 	if plan != nil && plan.Copy {
 		a = append(a, "-c:a", "copy")
 	} else {
@@ -1137,6 +1214,64 @@ func (s *Server) ffmpegCmdWithPlan(c cgroup, j Job, o Output, artifact string, s
 	}
 	a = append(a, filepath.Join(outDir, artifact))
 	return s.sandbox(&c, in, outDir, selected.devices, a), nil
+}
+
+func inputHardwareArgs(selected videoEncoder, copyVideo bool) []string {
+	if copyVideo {
+		return nil
+	}
+	switch selected.mode {
+	case "vaapi":
+		return []string{"-vaapi_device", selected.devices[0]}
+	case "nvenc":
+		return []string{"-hwaccel", "cuda", "-hwaccel_output_format", "cuda"}
+	default:
+		return nil
+	}
+}
+
+func videoFilter(selected videoEncoder, resolution Resolution) string {
+	switch selected.mode {
+	case "nvenc":
+		return scaleCUDA(resolution)
+	case "vaapi":
+		filter := scale(resolution)
+		if filter != "" {
+			filter += ","
+		}
+		return filter + "format=nv12,hwupload"
+	default:
+		return scale(resolution)
+	}
+}
+
+func videoEncoderArgs(selected videoEncoder, plan *AutoCompressionPlan, quality int) []string {
+	if plan != nil && plan.Copy {
+		return []string{"-c:v", "copy"}
+	}
+	args := []string{"-c:v", selected.name}
+	if plan != nil {
+		switch selected.mode {
+		case "vaapi":
+			args = append(args, "-rc_mode", "VBR")
+		case "nvenc":
+			args = append(args, "-rc", "vbr")
+		}
+		args = append(args, "-b:v", bitrateArg(plan.VideoBitrate), "-maxrate", bitrateArg(plan.VideoMaxrate), "-bufsize", bitrateArg(plan.VideoMaxrate*2))
+		if selected.mode == "software" {
+			args = append(args, "-pix_fmt", "yuv420p")
+		}
+		return args
+	}
+	switch selected.mode {
+	case "vaapi":
+		args = append(args, "-qp", strconv.Itoa(quality))
+	case "nvenc":
+		args = append(args, "-rc", "vbr", "-cq", strconv.Itoa(quality))
+	default:
+		args = append(args, "-crf", strconv.Itoa(quality), "-pix_fmt", "yuv420p")
+	}
+	return args
 }
 func (s *Server) sandbox(c *cgroup, in, output string, gpuDevices, program []string) *exec.Cmd {
 	args := []string{"--cgroup", func() string {
@@ -1262,9 +1397,16 @@ func vaapiRenderNode(path string) bool {
 }
 
 func nvidiaDevices() []string {
-	paths := []string{"/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"}
+	paths := []string{"/dev/nvidiactl", "/dev/nvidia-modeset", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"}
 	indexed, _ := filepath.Glob("/dev/nvidia[0-9]*")
 	paths = append(paths, indexed...)
+	caps, _ := filepath.Glob("/dev/nvidia-caps/nvidia-cap*")
+	paths = append(paths, caps...)
+	// Recent NVIDIA CDI configurations may also expose a DRM render node.
+	// CUDA/libcuda can use that node during device discovery, so pass the
+	// existing render nodes through to the nested Landlock sandbox as well.
+	renderNodes, _ := filepath.Glob("/dev/dri/renderD*")
+	paths = append(paths, renderNodes...)
 	devices := make([]string, 0, len(paths))
 	hasGPU := false
 	for _, path := range paths {
@@ -1437,6 +1579,16 @@ func compatible(o Output) bool {
 	return ok && f["v"][o.Video.Codec] && f["a"][o.Audio.Codec]
 }
 func scale(r Resolution) string {
+	return scaleFilter("scale", r)
+}
+func scaleCUDA(r Resolution) string {
+	filter := scaleFilter("scale_cuda", r)
+	if filter == "" {
+		return ""
+	}
+	return filter + ":format=yuv420p"
+}
+func scaleFilter(name string, r Resolution) string {
 	if r.Mode != "fit" {
 		return ""
 	}
@@ -1444,7 +1596,7 @@ func scale(r Resolution) string {
 	if r.Upscale == nil || !*r.Upscale {
 		up = ":force_original_aspect_ratio=decrease"
 	}
-	return fmt.Sprintf("scale=%d:%d%s:force_divisible_by=2", r.Width, r.Height, up)
+	return fmt.Sprintf("%s=%d:%d%s:force_divisible_by=2", name, r.Width, r.Height, up)
 }
 func crfRange(codec string) (int, int, error) {
 	switch codec {

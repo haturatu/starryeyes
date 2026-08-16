@@ -9,6 +9,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/starryeyes ./cmd/s
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc libseccomp-dev \
  && gcc -O2 -Wall -Wextra -o /out/sandbox-exec cmd/sandbox-exec/sandbox-exec.c -lseccomp \
+ && gcc -O2 -Wall -Wextra -DSANDBOX_EXEC_LANDLOCK_ONLY -o /out/sandbox-exec-landlock-only cmd/sandbox-exec/sandbox-exec.c -lseccomp \
  && gcc -O2 -Wall -Wextra -o /out/cgroup-exec cmd/cgroup-exec/cgroup-exec.c \
  && rm -rf /var/lib/apt/lists/*
 
@@ -48,3 +49,16 @@ USER starryeyes
 # Toolkit from the host. Keep this target separate so Compose can select the
 # intended hardware contract without installing a driver in the image.
 FROM runtime-base AS runtime-nvidia
+RUN set -eu \
+ && ffmpeg -hide_banner -hwaccels 2>&1 | grep -Eq '^[[:space:]]*cuda[[:space:]]*$' \
+ && ffmpeg -hide_banner -encoders 2>&1 | grep -Eq 'h264_nvenc|hevc_nvenc|av1_nvenc' \
+ && ffmpeg -hide_banner -filters 2>&1 | grep -Eq 'scale_cuda'
+
+# Debug-only target; production Compose files continue to use runtime-nvidia.
+FROM runtime-nvidia AS runtime-nvidia-debug
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends strace \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/sandbox-exec-landlock-only /usr/local/bin/sandbox-exec-landlock-only
+USER starryeyes

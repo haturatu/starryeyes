@@ -53,8 +53,8 @@ The Compose service uses distinct host paths for local job metadata/input spool 
 sudo install -d -o 10001 -g 999 -m 0750 /var/lib/starryeyes
 cp .env.example .env
 # Edit .env if your output path differs.
-docker compose config
-docker compose up --build
+sudo docker compose config
+sudo docker compose up --build
 ```
 
 ### Hardware encoding with Docker
@@ -66,10 +66,10 @@ The base Compose service deliberately does not expose GPU devices.
 For an Intel or AMD VA-API render node, layer `compose.vaapi.yaml` over the base configuration. It passes the selected `/dev/dri/renderD*` node into the container and keeps the container unprivileged. Set the host `render` group ID and an output directory first:
 
 ```sh
-export RENDER_GID="$(getent group render | cut -d: -f3)"
-export OUTPUT_DIR_HOST=/mnt/media/starryeyes
-
-docker compose \
+sudo env \
+	RENDER_GID="$(getent group render | cut -d: -f3)" \
+	OUTPUT_DIR_HOST=/mnt/media/starryeyes \
+	docker compose \
   -f compose.yaml \
   -f compose.vaapi.yaml \
   up --build
@@ -78,41 +78,71 @@ docker compose \
 `renderD128` is the default `VAAPI_DEVICE`, so it needs no additional setting. To use another render node, such as `renderD129`, include it in the launch command:
 
 ```sh
-VAAPI_DEVICE=/dev/dri/renderD129 \
-RENDER_GID="$(getent group render | cut -d: -f3)" \
-OUTPUT_DIR_HOST=/mnt/media/starryeyes \
-docker compose -f compose.yaml -f compose.vaapi.yaml up --build
+sudo env \
+	VAAPI_DEVICE=/dev/dri/renderD129 \
+	RENDER_GID="$(getent group render | cut -d: -f3)" \
+	OUTPUT_DIR_HOST=/mnt/media/starryeyes \
+	docker compose -f compose.yaml -f compose.vaapi.yaml up --build
 ```
 
 To inspect the final configuration before starting it:
 
 ```sh
-RENDER_GID="$(getent group render | cut -d: -f3)" \
-OUTPUT_DIR_HOST=/mnt/media/starryeyes \
-docker compose -f compose.yaml -f compose.vaapi.yaml config
+sudo env \
+	RENDER_GID="$(getent group render | cut -d: -f3)" \
+	OUTPUT_DIR_HOST=/mnt/media/starryeyes \
+	docker compose -f compose.yaml -f compose.vaapi.yaml config
 ```
 
 Set the same values in `.env` for repeated runs. Starryeyes grants the selected node only to the sandboxed FFmpeg worker, not to the HTTP process generally.
 
 #### NVIDIA / NVENC
 
-Install the NVIDIA Container Toolkit on the host and layer `compose.nvidia.yaml` over the base configuration. Docker supplies the required `/dev/nvidia*` nodes to FFmpeg. The override explicitly enables the Toolkit's `video,utility` driver capabilities, which are required by NVENC; it does not enable CUDA compute.
+Install the NVIDIA Container Toolkit on the host and layer `compose.nvidia.yaml` over the base configuration. Docker supplies the required `/dev/nvidia*` nodes to FFmpeg. The override enables the Toolkit's `compute,video,utility` driver capabilities: NVENC uses the Video Codec SDK and CUDA driver API, while utility provides NVML support.
 
 ```sh
-export OUTPUT_DIR_HOST=/mnt/media/starryeyes
-
-docker compose \
-  -f compose.yaml \
-  -f compose.nvidia.yaml \
-  up --build
+sudo env OUTPUT_DIR_HOST=/mnt/media/starryeyes \
+	docker compose \
+	-f compose.yaml \
+	-f compose.nvidia.yaml \
+	up --build
 ```
 
 To inspect the NVIDIA configuration first:
 
 ```sh
-OUTPUT_DIR_HOST=/mnt/media/starryeyes \
-docker compose -f compose.yaml -f compose.nvidia.yaml config
+sudo env OUTPUT_DIR_HOST=/mnt/media/starryeyes \
+	docker compose -f compose.yaml -f compose.nvidia.yaml config
 ```
+
+The host setup can be performed in separate steps with the repository scripts.
+The driver script does not reboot automatically:
+
+```sh
+sudo bash scripts/setup-nvidia-driver.sh
+sudo reboot
+sudo bash scripts/setup-nvidia-container-toolkit.sh
+bash scripts/check-nvidia-gpu.sh
+sudo bash scripts/start-nvidia.sh
+# Compare direct NVIDIA access with the nested Starryeyes sandbox.
+bash scripts/test-nvidia-sandbox.sh
+```
+
+For a CUDA initialization failure, use the optional debug target to compare
+Landlock-only and production sandbox behavior. It installs `strace` only in
+the diagnostic image; production Compose continues to use `runtime-nvidia`:
+
+```sh
+newgrp docker -c 'docker compose -f compose.yaml -f compose.nvidia.yaml -f compose.nvidia-debug.yaml up -d --build --force-recreate'
+bash scripts/trace-nvidia-sandbox.sh
+```
+
+`setup-nvidia-container-toolkit.sh` configures Docker and generates the CDI
+specification at `/etc/cdi/nvidia.yaml`. Run it only after `nvidia-smi` works
+following the reboot.
+
+The Docker helper scripts invoke Docker through `sudo` for non-root users; no
+membership in the `docker` group is required.
 
 ### rclone FUSE output storage
 
@@ -137,8 +167,8 @@ The service runs without `privileged`, drops all Linux capabilities, uses a read
 Inspect the service and data from the host or container:
 
 ```sh
-docker compose ps
-docker compose exec starryeyes ls -la /var/lib/starryeyes
+sudo docker compose ps
+sudo docker compose exec starryeyes ls -la /var/lib/starryeyes
 sudo ls -la /var/lib/starryeyes/spool
 sudo ls -la "$(sed -n 's/^OUTPUT_DIR_HOST=//p' .env)"
 ```
@@ -193,8 +223,8 @@ If `jobs.sqlite` is lost, stop the daemon and run the binary with `backfill`. It
 DATA_DIR=/var/lib/starryeyes OUTPUT_DIR=/mnt/output starryeyes backfill
 
 # With Compose, stop the service first, then run the same image as a one-off command.
-docker compose stop starryeyes
-docker compose run --rm starryeyes backfill
+sudo docker compose stop starryeyes
+sudo docker compose run --rm starryeyes backfill
 ```
 
 Invalid or modified artifacts are reported and are never imported. In-progress uploads cannot be reconstructed because their input spool and chunk verification data are intentionally local to `DATA_DIR`.
@@ -217,11 +247,11 @@ This schema intentionally does not migrate databases created before resumable up
 
 ## Security model
 
-- Landlock ABI 4 or newer is required at startup. Runtime libraries are read/execute-only, input is read-only, and only the job output directory and `/tmp` receive write/create rights.
-- Seccomp denies sockets, mount and namespace changes, ptrace, BPF, and other high-risk operations. FFmpeg and ffprobe additionally use `-protocol_whitelist file,pipe`.
+- Landlock ABI 4 or newer is required at startup. Runtime libraries are read/execute-only and input is read-only; normal workers write only to the job output directory and `/tmp`, while GPU workers additionally receive their private `/dev/shm` for CUDA IPC.
+- Seccomp blocks Internet-capable socket families while preserving AF_UNIX and AF_NETLINK for local GPU/runtime IPC and device discovery; mount and namespace changes, ptrace, BPF, and other high-risk operations remain denied. FFmpeg and ffprobe additionally use `-protocol_whitelist file,pipe`.
 - cgroup v2 limits memory, swap, PIDs, CPU weight, and CPU quota per job. Production systemd deployment uses delegated cgroups via [deploy/starryeyes.service](deploy/starryeyes.service).
 - The Docker container has no added capabilities, no privileged mode, `no-new-privileges`, a read-only root filesystem, and a dedicated bind-mounted data directory.
-- GPU device access is opt-in through the Compose overrides. The sandbox allowlists only the VA-API render node or NVIDIA device nodes selected for the job; VA-API workers additionally receive read-only access to `/sys/dev`, `/sys/class/drm`, `/sys/bus`, and `/sys/devices`, plus read-only directory access to `/dev/dri`.
+- GPU device access is opt-in through the Compose overrides. The sandbox allowlists only the VA-API render node or NVIDIA device nodes selected for the job; GPU workers additionally receive the read-only NVIDIA `/proc` and `/sys` discovery trees, `/dev/char` symlink lookup, the NVIDIA persistence socket when present, and their private `/dev/shm` for local CUDA IPC.
 
 Landlock controls access to the existing filesystem rather than creating a replacement root filesystem. Docker, seccomp, DAC, and host MAC policy remain part of the defense-in-depth boundary.
 
@@ -257,7 +287,7 @@ go vet ./...
 bash -n scripts/upload-directory.sh
 go run ./cmd/gen-docs public
 cp .env.example .env
-docker compose config
-RENDER_GID="$(getent group render | cut -d: -f3)" docker compose -f compose.yaml -f compose.vaapi.yaml config
-docker compose up --build
+sudo docker compose config
+sudo env RENDER_GID="$(getent group render | cut -d: -f3)" docker compose -f compose.yaml -f compose.vaapi.yaml config
+sudo docker compose up --build
 ```

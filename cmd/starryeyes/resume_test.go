@@ -137,6 +137,56 @@ func TestExpireUploadReleasesCapacityAndSpool(t *testing.T) {
 	}
 }
 
+func TestCleanupTerminalSpoolsPreservesActiveJobs(t *testing.T) {
+	service, _ := newAPITestServer(t)
+	now := time.Now().UTC()
+	jobs := map[string]string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": completed,
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": failed,
+		"cccccccccccccccccccccccccccccccc": expired,
+		"dddddddddddddddddddddddddddddddd": uploading,
+	}
+	for jobID, state := range jobs {
+		spoolDir := service.dir(jobID)
+		if err := os.MkdirAll(spoolDir, 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(spoolDir, "input"), []byte("test"), 0640); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.db.Exec(`INSERT INTO jobs(id,state,filename,size,expected,chunk_size,spec,reserved,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, jobID, state, "clip.mp4", 4, 1, 4, `{}`, 0, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orphanID := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	if err := os.MkdirAll(service.dir(orphanID), 0750); err != nil {
+		t.Fatal(err)
+	}
+	keepDir := filepath.Join(service.cfg.Data, "spool", "not-a-job")
+	if err := os.MkdirAll(keepDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	service.cleanupTerminalSpools()
+
+	for jobID, state := range jobs {
+		_, err := os.Stat(service.dir(jobID))
+		if state == uploading {
+			if err != nil {
+				t.Errorf("active %s spool removed: %v", jobID, err)
+			}
+		} else if !os.IsNotExist(err) {
+			t.Errorf("terminal %s spool still exists: %v", jobID, err)
+		}
+	}
+	if _, err := os.Stat(service.dir(orphanID)); !os.IsNotExist(err) {
+		t.Errorf("orphan spool still exists: %v", err)
+	}
+	if _, err := os.Stat(keepDir); err != nil {
+		t.Errorf("unrecognized spool entry removed: %v", err)
+	}
+}
+
 func TestChunkUploadPreventsConcurrentExpiry(t *testing.T) {
 	service, _ := newAPITestServer(t)
 	jobID := "78047daf0e72bd37dd856118a8eed24b"
