@@ -47,6 +47,12 @@ docker_exec sh -ceu '
 	find /run -maxdepth 3 -iname "*nvidia*" -ls 2>&1 || true
 '
 
+run_check 'NVIDIA FFmpeg capabilities' docker_exec sh -ceu '
+	ffmpeg -hide_banner -hwaccels 2>&1 | grep -Eq "^[[:space:]]*cuda[[:space:]]*$"
+	ffmpeg -hide_banner -encoders 2>&1 | grep -Eq "h264_nvenc|hevc_nvenc|av1_nvenc"
+	ffmpeg -hide_banner -filters 2>&1 | grep -Eq "scale_cuda"
+'
+
 run_check 'direct nvidia-smi' docker_exec nvidia-smi
 
 run_check 'sandboxed nvidia-smi' docker_exec sh -ceu '
@@ -109,6 +115,30 @@ run_check 'sandboxed NVENC' docker_exec sh -ceu '
 	exec "$@" -- ffmpeg -hide_banner -loglevel error \
 		-f lavfi -i testsrc2=size=1280x720:rate=30 \
 		-c:v h264_nvenc -t 3 -f null -
+'
+
+run_check 'sandboxed CUDA decode/scale/NVENC pipeline' docker_exec sh -ceu '
+	input=/tmp/nvidia-pipeline-input.mp4
+	trap "rm -f \"\$input\"" EXIT
+	ffmpeg -hide_banner -loglevel error -y \
+		-f lavfi -i testsrc2=size=1280x720:rate=30 \
+		-c:v h264_nvenc -pix_fmt yuv420p -an -t 1 "$input"
+	set -- /usr/local/bin/sandbox-exec --profile cpu --input "$input"
+	for p in \
+		/dev/nvidiactl \
+		/dev/nvidia-modeset \
+		/dev/nvidia-uvm \
+		/dev/nvidia-uvm-tools \
+		/dev/nvidia[0-9]* \
+		/dev/nvidia-caps/nvidia-cap* \
+		/dev/dri/renderD*
+	do
+		test -c "$p" && set -- "$@" --gpu-device "$p"
+	done
+	exec "$@" -- ffmpeg -hide_banner -loglevel error \
+		-hwaccel cuda -hwaccel_output_format cuda -i "$input" \
+		-vf scale_cuda=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p \
+		-c:v h264_nvenc -an -t 1 -f null -
 '
 
 if (( failures > 0 )); then

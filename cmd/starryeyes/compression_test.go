@@ -178,7 +178,13 @@ func TestFFmpegAutoCompressionArguments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(nvenc.Args, "-rc") || !slices.Contains(nvenc.Args, "vbr") || !slices.Contains(nvenc.Args, "-pix_fmt") {
-		t.Errorf("NVENC auto command = %q, want VBR and yuv420p", nvenc.Args)
+	if !slices.Contains(nvenc.Args, "-hwaccel") || !slices.Contains(nvenc.Args, "cuda") || !slices.Contains(nvenc.Args, "-hwaccel_output_format") {
+		t.Errorf("NVENC auto command = %q, want CUDA input acceleration", nvenc.Args)
+	}
+	if !slices.Contains(nvenc.Args, "scale_cuda=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p") {
+		t.Errorf("NVENC auto command = %q, want CUDA scaling", nvenc.Args)
+	}
+	if !slices.Contains(nvenc.Args, "-rc") || !slices.Contains(nvenc.Args, "vbr") || slices.Contains(nvenc.Args, "-pix_fmt") {
+		t.Errorf("NVENC auto command = %q, want VBR without a software pixel format", nvenc.Args)
 	}
 }

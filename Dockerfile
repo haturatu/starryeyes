@@ -49,6 +49,10 @@ USER starryeyes
 # Toolkit from the host. Keep this target separate so Compose can select the
 # intended hardware contract without installing a driver in the image.
 FROM runtime-base AS runtime-nvidia
+RUN set -eu \
+ && ffmpeg -hide_banner -hwaccels 2>&1 | grep -Eq '^[[:space:]]*cuda[[:space:]]*$' \
+ && ffmpeg -hide_banner -encoders 2>&1 | grep -Eq 'h264_nvenc|hevc_nvenc|av1_nvenc' \
+ && ffmpeg -hide_banner -filters 2>&1 | grep -Eq 'scale_cuda'
 
 # Debug-only target; production Compose files continue to use runtime-nvidia.
 FROM runtime-nvidia AS runtime-nvidia-debug
