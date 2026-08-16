@@ -114,6 +114,21 @@ OUTPUT_DIR_HOST=/mnt/media/starryeyes \
 docker compose -f compose.yaml -f compose.nvidia.yaml config
 ```
 
+The host setup can be performed in separate steps with the repository scripts.
+The driver script does not reboot automatically:
+
+```sh
+sudo bash scripts/setup-nvidia-driver.sh
+sudo reboot
+sudo bash scripts/setup-nvidia-container-toolkit.sh
+bash scripts/check-nvidia-gpu.sh
+sudo bash scripts/start-nvidia.sh
+```
+
+`setup-nvidia-container-toolkit.sh` configures Docker and generates the CDI
+specification at `/etc/cdi/nvidia.yaml`. Run it only after `nvidia-smi` works
+following the reboot.
+
 ### rclone FUSE output storage
 
 When `OUTPUT_DIR_HOST` is an rclone FUSE mount, Docker must be able to traverse the mount as the daemon user. Enable `user_allow_other` once in `/etc/fuse.conf`, then mount a generic remote and create the bind-mount source before starting Compose:
