@@ -1267,6 +1267,11 @@ func nvidiaDevices() []string {
 	paths = append(paths, indexed...)
 	caps, _ := filepath.Glob("/dev/nvidia-caps/nvidia-cap*")
 	paths = append(paths, caps...)
+	// Recent NVIDIA CDI configurations may also expose a DRM render node.
+	// CUDA/libcuda can use that node during device discovery, so pass the
+	// existing render nodes through to the nested Landlock sandbox as well.
+	renderNodes, _ := filepath.Glob("/dev/dri/renderD*")
+	paths = append(paths, renderNodes...)
 	devices := make([]string, 0, len(paths))
 	hasGPU := false
 	for _, path := range paths {

@@ -7,7 +7,12 @@ repository_directory=$(cd -- "$script_directory/.." && pwd)
 
 cd "$repository_directory"
 "$script_directory/check-nvidia-gpu.sh"
-exec docker compose \
+if (( EUID == 0 )); then
+	docker_command=(docker)
+else
+	docker_command=(sudo docker)
+fi
+exec "${docker_command[@]}" compose \
 	-f compose.yaml \
 	-f compose.nvidia.yaml \
 	up --build "$@"

@@ -9,6 +9,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/starryeyes ./cmd/s
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc libseccomp-dev \
  && gcc -O2 -Wall -Wextra -o /out/sandbox-exec cmd/sandbox-exec/sandbox-exec.c -lseccomp \
+ && gcc -O2 -Wall -Wextra -DSANDBOX_EXEC_LANDLOCK_ONLY -o /out/sandbox-exec-landlock-only cmd/sandbox-exec/sandbox-exec.c -lseccomp \
  && gcc -O2 -Wall -Wextra -o /out/cgroup-exec cmd/cgroup-exec/cgroup-exec.c \
  && rm -rf /var/lib/apt/lists/*
 
@@ -48,3 +49,12 @@ USER starryeyes
 # Toolkit from the host. Keep this target separate so Compose can select the
 # intended hardware contract without installing a driver in the image.
 FROM runtime-base AS runtime-nvidia
+
+# Debug-only target; production Compose files continue to use runtime-nvidia.
+FROM runtime-nvidia AS runtime-nvidia-debug
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends strace \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/sandbox-exec-landlock-only /usr/local/bin/sandbox-exec-landlock-only
+USER starryeyes

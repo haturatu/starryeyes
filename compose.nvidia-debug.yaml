@@ -1,0 +1,5 @@
+# Opt-in diagnostic image. Do not use this target for production deployment.
+services:
+  starryeyes:
+    build:
+      target: runtime-nvidia-debug

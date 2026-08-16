@@ -48,12 +48,19 @@ else
 fi
 
 printf '%s\n' '--- Docker ---'
+docker_command=()
 if ! command -v docker >/dev/null 2>&1; then
 	fail 'docker is not installed'
-elif docker info >/dev/null 2>&1; then
+elif (( EUID == 0 )); then
+	docker_command=(docker)
+else
+	docker_command=(sudo docker)
+fi
+
+if ((${#docker_command[@]} > 0)) && "${docker_command[@]}" info >/dev/null 2>&1; then
 	pass 'Docker daemon is reachable'
 else
-  fail 'Docker daemon is not reachable by the current user'
+	fail 'Docker daemon is not reachable via sudo'
 fi
 
 if (( failures > 0 )); then
