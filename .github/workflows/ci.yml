@@ -27,7 +27,7 @@ jobs:
           test -z "$gofmt_output"
 
       - name: Check Bash syntax
-        run: bash -n scripts/upload-directory.sh
+        run: bash -n scripts/upload-directory.sh scripts/setup-nvidia-driver.sh scripts/setup-nvidia-container-toolkit.sh scripts/check-nvidia-gpu.sh scripts/start-nvidia.sh
       - name: Check sandbox test syntax
         run: bash -n scripts/test-sandbox-exec.sh
 
