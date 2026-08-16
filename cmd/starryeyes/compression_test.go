@@ -185,6 +185,6 @@ func TestFFmpegAutoCompressionArguments(t *testing.T) {
 		t.Errorf("NVENC auto command = %q, want CUDA scaling", nvenc.Args)
 	}
 	if !slices.Contains(nvenc.Args, "-rc") || !slices.Contains(nvenc.Args, "vbr") || slices.Contains(nvenc.Args, "-pix_fmt") {
-		t.Errorf("NVENC auto command = %q, want VBR without a software pixel format", nvenc.Args)
+		t.Errorf("NVENC auto command = %q, want VBR and yuv420p", nvenc.Args)
 	}
 }
