@@ -1,10 +1,10 @@
 module github.com/haturatu/starryeyes
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/danielgtaylor/huma/v2 v2.39.1
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	modernc.org/sqlite v1.59.0
 )
 
