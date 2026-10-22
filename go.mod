@@ -1,6 +1,6 @@
 module github.com/haturatu/starryeyes
 
-go 1.26.0
+go 1.27.3
 
 require (
 	github.com/danielgtaylor/huma/v2 v2.39.1
