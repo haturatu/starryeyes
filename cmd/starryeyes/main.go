@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"mime"
@@ -60,8 +61,8 @@ type Server struct {
 	scheduleMu  sync.Mutex
 	admissionMu sync.Mutex
 	// A handler taking both locks must acquire the lifecycle lock first.
-	lifecycleLocks sync.Map
-	chunkLocks     sync.Map
+	lifecycleLocks [256]sync.RWMutex
+	chunkLocks     [256]sync.Mutex
 }
 type Job struct {
 	ID, State, Filename, Spec, InputHash, ActualHash string
@@ -1299,14 +1300,19 @@ func chunkBytes(size, chunkSize int64, n int) int64 {
 	}
 	return chunkSize
 }
+
+// Fixed stripes preserve same-key lock identity for owners and waiters without
+// retaining attacker-controlled job/chunk keys. Collisions only serialize work.
+func lockStripe(key string) uint32 {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(key))
+	return hash.Sum32() % 256
+}
 func (s *Server) lifecycleLock(jobID string) *sync.RWMutex {
-	v, _ := s.lifecycleLocks.LoadOrStore(jobID, &sync.RWMutex{})
-	return v.(*sync.RWMutex)
+	return &s.lifecycleLocks[lockStripe(jobID)]
 }
 func (s *Server) chunkLock(jobID string, number int) *sync.Mutex {
-	k := jobID + ":" + strconv.Itoa(number)
-	v, _ := s.chunkLocks.LoadOrStore(k, &sync.Mutex{})
-	return v.(*sync.Mutex)
+	return &s.chunkLocks[lockStripe(jobID+":"+strconv.Itoa(number))]
 }
 
 type cgroup struct{ path string }
