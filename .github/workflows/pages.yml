@@ -3,6 +3,12 @@ name: Deploy API documentation
 on:
   push:
     branches: [main]
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
