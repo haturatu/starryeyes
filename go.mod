@@ -3,7 +3,7 @@ module github.com/haturatu/starryeyes
 go 1.27.3
 
 require (
-	github.com/danielgtaylor/huma/v2 v2.39.1
+	github.com/danielgtaylor/huma/v2 v2.40.0
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.61.0
 )
