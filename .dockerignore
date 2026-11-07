@@ -7,3 +7,19 @@
 *.mkv
 *.webm
 bin
+# Exclude runtime secrets, databases, and private artifacts from every stage.
+**/.env
+**/.env.*
+**/*.db
+**/*.db-*
+**/*.sqlite3
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*
+**/uploads
+**/secrets
+**/spool
+**/output

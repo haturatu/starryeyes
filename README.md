@@ -291,3 +291,9 @@ sudo docker compose config
 sudo env RENDER_GID="$(getent group render | cut -d: -f3)" docker compose -f compose.yaml -f compose.vaapi.yaml config
 sudo docker compose up --build
 ```
+
+### Published GHCR image
+
+The `runtime-base` CPU image is built from source and published to `ghcr.io/haturatu/starryeyes` on pushes to `main` and `v*` tags only. GitHub Actions authenticates with `GITHUB_TOKEN`; no local environment file, output media, keys, or runtime database is embedded. After first publication, change the package visibility to **Public** in GitHub Packages.
+
+For a prebuilt image, change the local Compose service from `build:` to `image: ghcr.io/haturatu/starryeyes:latest` while retaining the existing bind mounts, host-side `OUTPUT_DIR_HOST` and other runtime settings. The VA-API/NVIDIA targets continue to use their existing opt-in Compose overrides and local builds; this published tag is the CPU `runtime-base` target.
